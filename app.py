@@ -1217,10 +1217,10 @@ with tab5:
         all_skus_with_sales = sorted(daily['Producto'].unique())
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            _fc_def = (all_skus_with_sales.index(sel_product)
-                       if sel_product and sel_product in all_skus_with_sales else 0)
+            if sel_product and sel_product in all_skus_with_sales:
+                st.session_state['fc_sku'] = sel_product
             sel_fc = st.selectbox("Selecciona un producto", all_skus_with_sales,
-                                  index=_fc_def, key='fc_sku')
+                                  key='fc_sku')
         with col_b:
             horizon_weeks = st.selectbox(
                 "Horizonte de predicción",
@@ -1384,9 +1384,9 @@ with tab6:
         yy_data = dy.copy()
         if yy_scope == "Un SKU específico":
             _yy_list = sorted(dy['Producto'].unique())
-            _yy_def  = (_yy_list.index(sel_product)
-                        if sel_product and sel_product in _yy_list else 0)
-            yy_sku = st.selectbox("Producto", _yy_list, index=_yy_def, key='yy_sku')
+            if sel_product and sel_product in _yy_list:
+                st.session_state['yy_sku'] = sel_product
+            yy_sku = st.selectbox("Producto", _yy_list, key='yy_sku')
             yy_data = yy_data[yy_data['Producto'] == yy_sku]
 
         colors_yy = [C_GREY, C_BLUE, C_GREEN, C_ORANGE, C_RED]
@@ -1460,12 +1460,12 @@ with tab7:
     st.markdown("### Detalle por SKU")
 
     sku_list = sorted(daily['Producto'].unique())
-    def_idx = (
-        sku_list.index(sel_product) if sel_product and sel_product in sku_list
-        else (sku_list.index('Stroom Master PRO') if 'Stroom Master PRO' in sku_list else 0)
-    )
-    sel_sku = st.selectbox("Selecciona un producto", sku_list,
-                           index=def_idx, key='detail_sku')
+    if sel_product and sel_product in sku_list:
+        st.session_state['detail_sku'] = sel_product
+    elif 'detail_sku' not in st.session_state:
+        _d_default = ('Stroom Master PRO' if 'Stroom Master PRO' in sku_list else sku_list[0])
+        st.session_state['detail_sku'] = _d_default
+    sel_sku = st.selectbox("Selecciona un producto", sku_list, key='detail_sku')
 
     sku_row = proc[proc['Producto'] == sel_sku]
     if len(sku_row):
