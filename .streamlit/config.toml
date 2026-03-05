@@ -1,0 +1,14 @@
+[theme]
+base            = "light"
+primaryColor    = "#1565C0"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FAFBFC"
+textColor       = "#37474F"
+font            = "sans serif"
+
+[server]
+headless = true       # required for cloud / docker deploys
+maxUploadSize = 50    # MB — increase if data.xlsx grows
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,38 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Diagnostic / dev-only scripts (not needed in production)
+_*.py
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local IDE settings
+.vscode/settings.json
+
+# Logs
+*.log
+
+# ──────────────────────────────────────────────────────────────
+# FILES THAT MUST BE COMMITTED (needed by the app):
+#   app.py
+#   requirements.txt
+#   data.xlsx
+#   stock.xlsx
+#   prophet_curves.parquet
+#   prophet_demand_30d.parquet
+#   model_comparison.parquet   (optional — improves Tab 5 table)
+#   daily_sales.parquet        (notebook only — not required by app.py)
+# ──────────────────────────────────────────────────────────────
