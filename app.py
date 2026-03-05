@@ -808,7 +808,7 @@ with tab1:
 # ══════════════════════════════════════════════════════════════
 with tab2:
     st.markdown("### Días de Cobertura por SKU")
-    st.caption("Todos los SKUs. Los sin stock (0 u) aparecen arriba en gris. Las líneas verticales marcan umbrales clave.")
+    st.caption("Todos los SKUs por estado de inventario. SKUs sin stock aparecen arriba (barra roja, 0 días). Las líneas verticales marcan umbrales clave.")
 
     disp = proc.copy()
     # Orden explícito: zero-stock al FINAL de categoryarray → aparecen arriba con autorange='reversed'
@@ -821,15 +821,13 @@ with tab2:
         lambda x: '∞' if x == np.inf or x >= 9999 else f'{x:.0f}')
 
     fig2 = go.Figure()
-    # Separar SKUs con stock > 0 y stock = 0
-    disp_active = disp[disp['Stock'] > 0]
-    disp_zero   = disp[disp['Stock'] == 0]
-
+    # Todos los SKUs agrupados por acción — incluye stock=0 clasificados correctamente
+    # (esto alinea los recuentos con Tab 3 Punto de Reorden y Tab 4 Hoja de Compras)
     for st_val, lbl, col in [
         (ST_CRITICAL, 'Pedir ahora',       C_RED),
         (ST_WARNING,  'Pedir esta semana',  C_ORANGE),
         (ST_OK,       'Cobertura correcta', C_GREEN)]:
-        sub = disp_active[disp_active['Action'] == st_val]
+        sub = disp[disp['Action'] == st_val]
         if not len(sub): continue
         fig2.add_trace(go.Bar(
             y=sub['Producto'], x=sub['DoS_clip'],
@@ -844,27 +842,16 @@ with tab2:
                 'Punto de reorden: %{customdata[3]:.0f} u'
                 '<extra></extra>')))
 
-    # SKUs sin stock — aparecen como barra gris de 0
-    if len(disp_zero):
-        fig2.add_trace(go.Bar(
-            y=disp_zero['Producto'], x=[0]*len(disp_zero),
-            orientation='h', name='Sin stock (0 u)', marker_color='#B0BEC5',
-            customdata=np.stack([disp_zero['Avg_Daily_Sales'],
-                                 disp_zero['Reorder_Point']], axis=1),
-            hovertemplate=(
-                '<b>%{y}</b><br>'
-                'Stock: 0 u<br>'
-                'Venta media/día: %{customdata[0]:.2f} u<br>'
-                'Punto de reorden: %{customdata[1]:.0f} u'
-                '<extra></extra>')))
-
     fig2.add_vline(x=LEAD_TIME_DAYS, line_dash='dash', line_color=C_RED,
                    annotation_text=f'Plazo entrega ({LEAD_TIME_DAYS} d)',
-                   annotation_position='top right', annotation_font_size=10)
+                   annotation_position='top right', annotation_font_size=9,
+                   annotation_yshift=0)
     fig2.add_vline(x=30, line_dash='dash', line_color=C_AMBER,
-                   annotation_text='Alerta 30 d', annotation_font_size=10)
+                   annotation_text='Alerta 30 d', annotation_font_size=9,
+                   annotation_position='top right', annotation_yshift=-18)
     fig2.add_vline(x=90, line_dash='dot', line_color='#78909C',
-                   annotation_text='Saludable 90 d', annotation_font_size=10)
+                   annotation_text='Saludable 90 d', annotation_font_size=9,
+                   annotation_position='top right', annotation_yshift=-36)
 
     styled_fig(fig2,
         height=max(450, 25*len(disp)), hovermode='y unified', barmode='stack',
@@ -997,7 +984,7 @@ with tab3:
         legend=dict(orientation='h', y=1.06, x=0.5, xanchor='center',
                     font_size=11, bgcolor='rgba(255,255,255,0.9)',
                     bordercolor='#E0E0E0', borderwidth=1),
-        xaxis_title='Unidades',
+        xaxis=dict(title='Unidades', rangemode='tozero'),
         yaxis=dict(autorange='reversed', tickfont_size=10),
         margin=dict(t=70, b=50, l=10, r=20))
     if sel_product and sel_product in rop['Producto'].values:
@@ -1007,6 +994,64 @@ with tab3:
                        fillcolor='rgba(255,183,0,0.22)',
                        line=dict(color='#F57F17', width=1.5), layer='below')
     st.plotly_chart(fig3, use_container_width=True)
+
+    # ── Detalle del producto seleccionado ───────────────────────────────────
+    if sel_product and sel_product in rop['Producto'].values:
+        rop_sel = rop[rop['Producto'] == sel_product].iloc[0]
+        _status_color = C_RED if rop_sel['Below_ROP'] else '#1B5E20'
+        _status_label = ('🔴  PEDIR AHORA — stock por debajo del punto de reorden'
+                         if rop_sel['Below_ROP']
+                         else '🟢  Stock sobre el punto de reorden')
+        st.markdown(f"---\n#### Detalle ROP — {sel_product}")
+        st.markdown(
+            f"<div style='font-size:14px;font-weight:600;color:{_status_color};margin-bottom:8px'>"
+            f"{_status_label}</div>",
+            unsafe_allow_html=True)
+
+        fig3d = go.Figure()
+        fig3d.add_trace(go.Bar(
+            y=[sel_product], x=[rop_sel['_lt']],
+            orientation='h', name='Demanda en tránsito',
+            marker_color=C_BLUE, hoverinfo='skip'))
+        fig3d.add_trace(go.Bar(
+            y=[sel_product], x=[rop_sel['_ss']],
+            orientation='h', name='Stock de seguridad',
+            marker_color=C_ORANGE, hoverinfo='skip'))
+        if rop_sel['_rb'] > 0:
+            fig3d.add_trace(go.Bar(
+                y=[sel_product], x=[rop_sel['_rb']],
+                orientation='h', name='Buffer revendedor',
+                marker_color=C_GREEN, hoverinfo='skip'))
+        _dm_col = C_RED if rop_sel['Below_ROP'] else '#1B5E20'
+        _dm_nm  = 'Stock actual (bajo ROP)' if rop_sel['Below_ROP'] else 'Stock actual (sobre ROP)'
+        fig3d.add_trace(go.Scatter(
+            x=[rop_sel['_stock']], y=[sel_product],
+            mode='markers', name=_dm_nm,
+            marker=dict(symbol='diamond', size=28, color=_dm_col,
+                        line=dict(color='white', width=2.5)),
+            hovertext=[rop_sel['_hover']],
+            hovertemplate='%{hovertext}<extra></extra>'))
+        styled_fig(fig3d,
+            barmode='stack', height=180,
+            hovermode='closest',
+            legend=dict(orientation='h', y=1.6, x=0.5, xanchor='center', font_size=12,
+                        bgcolor='rgba(255,255,255,0.9)', bordercolor='#E0E0E0', borderwidth=1),
+            xaxis=dict(title='Unidades', rangemode='tozero'),
+            yaxis=dict(tickfont_size=14, tickfont=dict(color=_status_color)),
+            margin=dict(t=85, b=50, l=10, r=20))
+        st.plotly_chart(fig3d, use_container_width=True)
+
+        _rop_total = rop_sel['_lt'] + rop_sel['_ss'] + rop_sel['_rb']
+        _avg_row   = proc[proc['Producto'] == sel_product]['Avg_Daily_Sales']
+        _avg_val   = float(_avg_row.iloc[0]) if len(_avg_row) else 0.0
+        c1d, c2d, c3d, c4d, c5d = st.columns(5)
+        c1d.metric("Stock actual", f"{rop_sel['_stock']:.0f} u",
+                   delta=f"{rop_sel['_stock'] - _rop_total:+.0f} u vs ROP",
+                   delta_color='normal' if rop_sel['_stock'] >= _rop_total else 'inverse')
+        c2d.metric("Punto de reorden", f"{_rop_total:.0f} u")
+        c3d.metric("Demanda en tránsito", f"{rop_sel['_lt']:.0f} u")
+        c4d.metric("Stock de seguridad", f"{rop_sel['_ss']:.0f} u")
+        c5d.metric("Venta media / día", f"{_avg_val:.2f} u")
 
     # Explicaciones detalladas
     st.markdown("""
@@ -1328,6 +1373,8 @@ with tab6:
     if len(years) >= 2:
         c1, c2 = st.columns(2)
         with c1:
+            if sel_product:
+                st.session_state['yy_scope'] = 'Un SKU específico'
             yy_scope = st.radio("Alcance", ["Todos los SKUs", "Un SKU específico"],
                                 horizontal=True, key='yy_scope')
         with c2:
