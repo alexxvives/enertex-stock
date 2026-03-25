@@ -214,26 +214,50 @@ async def receive_stock(
     _verify(x_secret)
     raw: Any = await request.json()
 
-    # ── Normalise to {name_or_sku: quantity} ──────────────────
-    stock_map: dict[str, int] = {}
+    # stock_map  → aggregated {product_name: total_qty}  (used by the dashboard)
+    # sku_detail → per-variant list [{product, variant, sku, quantity}]
+    stock_map:  dict[str, int] = {}
+    sku_detail: list[dict]     = []
 
     def _extract(items: list) -> None:
         for item in items:
             if not isinstance(item, dict):
                 continue
             qty = int(item.get("quantity", item.get("stock", item.get("qty", 0))))
-            # Prefer product title, fall back to SKU, then barcode
-            name = (
-                item.get("product")
-                or item.get("product_title")
+
+            # Product name (base, without variant)
+            product = (
+                item.get("product_title")
+                or item.get("product")
                 or item.get("title")
                 or item.get("name")
-                or item.get("sku")
-                or item.get("barcode")
                 or ""
             )
-            if name:
-                stock_map[name] = qty
+            # Variant title ("Default Title" means no real variant)
+            variant = (
+                item.get("variant_title")
+                or item.get("variant")
+                or item.get("option1")
+                or ""
+            )
+            if variant.lower() in ("default title", "default"):
+                variant = ""
+
+            sku = item.get("sku") or item.get("barcode") or ""
+            name = product or sku
+            if not name:
+                continue
+
+            # Aggregate total stock per product (sum all variants)
+            stock_map[name] = stock_map.get(name, 0) + qty
+
+            # Keep per-variant detail for /current-stock
+            sku_detail.append({
+                "product":  product,
+                "variant":  variant,
+                "sku":      sku,
+                "quantity": qty,
+            })
 
     if isinstance(raw, list):
         _extract(raw)
@@ -243,26 +267,29 @@ async def receive_stock(
                 _extract(raw[key])
                 break
         else:
-            # Maybe the dict IS already {name: qty}
+            # Plain {name: qty} dict (e.g. seeded from seed_stock.py)
             for k, v in raw.items():
                 if isinstance(v, (int, float)):
-                    stock_map[k] = int(v)
+                    stock_map[k] = stock_map.get(k, 0) + int(v)
 
     output = {
-        "updated_at": _timestamp(),
-        "source":     "amphora",
-        "stock":      stock_map,
-        "_raw":       raw,          # kept for debugging; app.py ignores this
+        "updated_at":   _timestamp(),
+        "source":       "amphora",
+        "stock":        stock_map,    # aggregated per product — used by app.py
+        "stock_by_sku": sku_detail,   # per variant — for reference / future UI
+        "_raw":         raw,
     }
-    # Update in-memory cache (read by GET /current-stock)
     _stock_cache.clear()
     _stock_cache.update(output)
-    # Also persist to disk as a backup
     try:
         STOCK_FILE.write_text(json.dumps(output, indent=2, ensure_ascii=False))
     except Exception:
         pass
-    return {"status": "ok", "items_received": len(stock_map)}
+    return {
+        "status":        "ok",
+        "products":      len(stock_map),
+        "variants":      len(sku_detail),
+    }
 
 
 # ── POST /return-status (+ sub-routes for each status) ──────
@@ -308,43 +335,66 @@ async def return_status(
 async def current_stock():
     """
     Public endpoint — Streamlit Cloud calls this to get the latest stock.
-    No X-Secret required (stock quantities are not sensitive business secrets).
-    Returns: {"updated_at": "...", "stock": {"Product Name": qty, ...}}
+    No X-Secret required.
+    Returns:
+      updated_at   – ISO timestamp of last stock push
+      stock        – {product_name: total_qty}  (variants aggregated)
+      stock_by_sku – [{product, variant, sku, quantity}]  (per variant)
     """
-    # Try in-memory cache first, then fall back to disk
-    if _stock_cache:
-        return JSONResponse({
-            "updated_at": _stock_cache.get("updated_at"),
-            "stock":      _stock_cache.get("stock", {}),
-        })
-    if STOCK_FILE.exists():
+    src = _stock_cache or None
+    if not src and STOCK_FILE.exists():
         try:
-            d = json.loads(STOCK_FILE.read_text(encoding="utf-8"))
-            return JSONResponse({
-                "updated_at": d.get("updated_at"),
-                "stock":      d.get("stock", {}),
-            })
+            src = json.loads(STOCK_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return JSONResponse({"updated_at": None, "stock": {}}, status_code=200)
+    if src:
+        return JSONResponse({
+            "updated_at":   src.get("updated_at"),
+            "stock":        src.get("stock", {}),
+            "stock_by_sku": src.get("stock_by_sku", []),
+        })
+    return JSONResponse({"updated_at": None, "stock": {}, "stock_by_sku": []})
+
+
+# ── GET /orders-log  ◄── ORDER STATUS UPDATES FROM AMPHORA ───
+@app.get("/orders-log")
+async def orders_log():
+    """
+    Returns the last 200 order-status events received from Amphora.
+    Useful for checking what Amphora has reported without needing Shopify.
+    """
+    if ORDERS_FILE.exists():
+        try:
+            events: list = json.loads(ORDERS_FILE.read_text(encoding="utf-8"))
+            return JSONResponse({"count": len(events), "events": events[-200:]})
+        except Exception:
+            pass
+    return JSONResponse({"count": 0, "events": []})
 
 
 # ── Health check ──────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    stock_age = _stock_cache.get("updated_at")
-    if not stock_age and STOCK_FILE.exists():
+    src = _stock_cache or {}
+    if not src and STOCK_FILE.exists():
         try:
-            d = json.loads(STOCK_FILE.read_text(encoding="utf-8"))
-            stock_age = d.get("updated_at")
+            src = json.loads(STOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            src = {}
+    order_count = 0
+    if ORDERS_FILE.exists():
+        try:
+            order_count = len(json.loads(ORDERS_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
     return {
-        "status":             "ok",
-        "secret_configured":  bool(AMPHORA_SECRET),
-        "shopify_configured": bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
-        "stock_last_updated": stock_age,
-        "stock_items_cached": len(_stock_cache.get("stock", {})),
+        "status":              "ok",
+        "secret_configured":   bool(AMPHORA_SECRET),
+        "shopify_configured":  bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
+        "stock_last_updated":  src.get("updated_at"),
+        "stock_products":      len(src.get("stock", {})),
+        "stock_variants":      len(src.get("stock_by_sku", [])),
+        "order_events_stored": order_count,
     }
 
 
