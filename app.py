@@ -539,16 +539,44 @@ def load_all():
                                   sku_stats['Safety_Stock'] +
                                   sku_stats['Reseller_LT_Buffer'])
 
-    # Stock: read from stock.xlsx (user-maintained file) with fallback to
-    # the hardcoded ACTUAL_STOCK dict in case the file is missing.
-    _stock_file = os.path.join(base, 'stock.xlsx')
-    if os.path.exists(_stock_file):
+    # Stock priority:
+    #   1) Amphora Railway webhook  (AMPHORA_WEBHOOK_URL env var)
+    #   2) amphora_stock.json       (local / Railway disk)
+    #   3) stock.xlsx               (manually maintained)
+    #   4) hardcoded ACTUAL_STOCK   (fallback)
+    import json as _json
+    _webhook_url  = (st.secrets.get("AMPHORA_WEBHOOK_URL") or os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
+    _amphora_json = os.path.join(base, 'amphora_stock.json')
+    _stock_file   = os.path.join(base, 'stock.xlsx')
+    _stock_map    = None
+
+    if _webhook_url:
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=4) as _resp:
+                _d = _json.loads(_resp.read())
+            if isinstance(_d.get("stock"), dict):
+                _stock_map = _d["stock"]
+        except Exception:
+            _stock_map = None   # fall through to next source
+
+    if _stock_map is None and os.path.exists(_amphora_json):
+        try:
+            _d = _json.loads(open(_amphora_json, encoding='utf-8').read())
+            _stock_map = _d.get('stock', _d)
+            if not isinstance(_stock_map, dict):
+                raise ValueError
+        except Exception:
+            _stock_map = None
+
+    if _stock_map is None and os.path.exists(_stock_file):
         try:
             _stock_df  = pd.read_excel(_stock_file)
             _stock_map = dict(zip(_stock_df['Producto'], _stock_df['Stock']))
         except Exception:
-            _stock_map = ACTUAL_STOCK
-    else:
+            _stock_map = None
+
+    if _stock_map is None:
         _stock_map = ACTUAL_STOCK
     sku_stats['Stock'] = sku_stats['Producto'].map(_stock_map).fillna(0)
     sku_stats['Below_ROP'] = sku_stats['Stock'] < sku_stats['Reorder_Point']
@@ -664,13 +692,31 @@ with st.sidebar:
 
     st.divider()
 
-    _stock_ok = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock.xlsx'))
+    _base_dir      = os.path.dirname(os.path.abspath(__file__))
+    _amphora_ok    = os.path.exists(os.path.join(_base_dir, 'amphora_stock.json'))
+    _stock_ok      = os.path.exists(os.path.join(_base_dir, 'stock.xlsx'))
+    _webhook_url2  = (st.secrets.get("AMPHORA_WEBHOOK_URL") or os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
+    if _webhook_url2:
+        _stock_label = f"Amphora Railway live ✓"
+        _stock_color = "#2E7D32"
+    elif _amphora_ok:
+        import json as _j2
+        try:
+            _aj = _j2.loads(open(os.path.join(_base_dir, 'amphora_stock.json'), encoding='utf-8').read())
+            _stock_label = f"Amphora live ✓ ({_aj.get('updated_at','')[:16]})"
+            _stock_color = "#2E7D32"
+        except Exception:
+            _stock_label, _stock_color = "amphora_stock.json (error al leer)", "#C62828"
+    elif _stock_ok:
+        _stock_label, _stock_color = "stock.xlsx ✓", "#1565C0"
+    else:
+        _stock_label, _stock_color = "hardcoded (sin fuente en vivo)", "#E65100"
     st.markdown(
         f"<div style='font-size:0.78rem;color:#78909C;'>"
         f"Plazo de entrega: <b>{LEAD_TIME_DAYS} días</b> · "
         f"Nivel de servicio: <b>{SERVICE_LEVEL*100:.0f}%</b><br>"
         f"Ventana estadística: <b>{STATS_WINDOW_DAYS} días</b><br>"
-        f"Stock: <b>{'stock.xlsx ✓' if _stock_ok else 'hardcoded (stock.xlsx no encontrado)'}</b>"
+        f"Stock: <b style='color:{_stock_color}'>{_stock_label}</b>"
         f"</div>",
         unsafe_allow_html=True)
 
