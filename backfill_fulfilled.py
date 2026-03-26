@@ -45,7 +45,30 @@ PROD_NAME_MAP = {
 EXCLUDE_PRODUCTS = [
     'Envio', 'Envío gratuito', 'Seguro', 'Seguro (1,5%)',
     'Batch', 'Batch costes', 'Zona EU 1', 'Zona EU 2', 'Zona EU 3',
+    'Funda',
 ]
+
+PACK_COMPONENTS = {
+    'Pack contra la electricidad sucia':
+        {'BEEM – EMI METER': 1, 'Stroom Master PRO': 4},
+    'Kit de Protección a la Radiación para Bebés y Niños':
+        {'SPIRO Disc': 1, 'SPIRO Square': 1, 'SPIRO Card': 2},
+    'Protección a Exposición Alta Individual':
+        {'SPIRO Card': 1, 'SPIRO Disc X': 1},
+    'Protección a exposición alta individual':
+        {'SPIRO Card': 1, 'SPIRO Disc X': 1},
+    'Protección a Exposición Severa Casos con EHS':
+        {'SPIRO Card': 1, 'SPIRO Disc Ultra': 1},
+    'Protección a exposición severa casos con EHS':
+        {'SPIRO Card': 1, 'SPIRO Disc Ultra': 1},
+    'Protección Básica Individual':
+        {'SPIRO Disc': 1, 'SPIRO Card': 1},
+    'Protección Estándar Espacios':
+        {'SPIRO Square': 1, 'SPIRO Disc': 1, 'SPIRO Disc X': 1,
+         'SPIRO Disc Ultra': 1, 'Stroom Master PRO': 1},
+    'Protección Estándar Oficina':
+        {'Stroom Master PRO': 2},
+}
 
 
 def load_excel():
@@ -71,23 +94,29 @@ def load_excel():
 
 
 def build_orders(df):
-    """Convert rows into fulfilled-order dicts grouped by (date, product)."""
-    # Each unique (date, product) becomes one synthetic "order" with one line item.
-    # We assign a stable order_id so re-runs don't create duplicates.
+    """Convert rows into fulfilled-order dicts grouped by (date, product).
+    Pack products are automatically expanded into their component line items.
+    """
+    _PACK_NAMES = set(PACK_COMPONENTS.keys())
     orders = []
     grouped = df.groupby([df['Fecha'].dt.date, 'Producto'])['Unidades'].sum()
     for (date, product), units in grouped.items():
         oid = f"xlsx-{date}-{product[:30]}".replace(" ", "_")
+        # Expand pack into component line items
+        if product in _PACK_NAMES:
+            line_items = [
+                {"product_title": comp, "variant_title": "", "sku": "",
+                 "quantity": int(units * qty_per_pack)}
+                for comp, qty_per_pack in PACK_COMPONENTS[product].items()
+            ]
+        else:
+            line_items = [{"product_title": product, "variant_title": "",
+                           "sku": "", "quantity": int(units)}]
         orders.append({
             "order_id":     oid,
             "fulfilled_at": str(date),
             "source":       "data_xlsx_backfill",
-            "line_items": [{
-                "product_title": product,
-                "variant_title": "",
-                "sku":           "",
-                "quantity":      int(units),
-            }],
+            "line_items":   line_items,
         })
     return orders
 

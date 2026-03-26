@@ -194,6 +194,7 @@ ACTUAL_STOCK = {
 EXCLUDE_PRODUCTS = [
     'Envio', 'Envío gratuito', 'Seguro', 'Seguro (1,5%)',
     'Batch', 'Batch costes', 'Zona EU 1', 'Zona EU 2', 'Zona EU 3',
+    'Funda',
 ]
 
 # Etiquetas de estado (sin emojis)
@@ -444,19 +445,29 @@ def load_all():
     if _webhook_url:
         try:
             import urllib.request as _ur
-            with _ur.urlopen(f"{_webhook_url}/sales-history", timeout=15) as _r:
+            with _ur.urlopen(f"{_webhook_url}/sales-history", timeout=45) as _r:
                 _sh = _json.loads(_r.read())
             if _sh.get("daily"):
                 _rows = []
+                _PACK_NAMES = set(PACK_COMPONENTS.keys())
+                _EXCLUDE_SET = set(EXCLUDE_PRODUCTS)
                 for _e in _sh["daily"]:
                     _prod = PROD_NAME_MAP.get(_e["product"], _e["product"])
-                    _var  = _e.get("variant", "")
-                    # Include variant in product name when present
+                    _units = int(_e["units"])
+                    _dt = pd.to_datetime(_e["date"])
+                    if _prod in _EXCLUDE_SET:
+                        continue
+                    # Expand pack products into their components
+                    if _prod in _PACK_NAMES:
+                        for _comp, _qty_per in PACK_COMPONENTS[_prod].items():
+                            _rows.append({"Date": _dt, "Producto": _comp,
+                                          "Units": _units * _qty_per,
+                                          "Revenue": 0.0, "Is_Reseller": False})
+                        continue
+                    _var = _e.get("variant", "")
                     _label = f"{_prod} - {_var}" if _var else _prod
-                    _rows.append({"Date": pd.to_datetime(_e["date"]),
-                                  "Producto": _label,
-                                  "Units": int(_e["units"]),
-                                  "Revenue": 0.0,
+                    _rows.append({"Date": _dt, "Producto": _label,
+                                  "Units": _units, "Revenue": 0.0,
                                   "Is_Reseller": False})
                 if _rows:
                     _amphora_daily = pd.DataFrame(_rows)
@@ -598,7 +609,7 @@ def load_all():
         try:
             import urllib.request as _ur
             # Render free tier may be sleeping — fall through to next source on failure.
-            with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=15) as _resp:
+            with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=45) as _resp:
                 _d = _json.loads(_resp.read())
             if isinstance(_d.get("stock"), dict) and _d["stock"]:
                 _stock_map = dict(_d["stock"])  # copy so we can extend with variants
@@ -883,34 +894,7 @@ with tab1:
         margin=dict(t=20, b=50, l=60, r=20))
     st.plotly_chart(fig1, use_container_width=True)
 
-    _has_revenue = daily_filtered['Revenue'].sum() > 0
-
-    if _has_revenue:
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.markdown("#### Top 10 SKUs — Ingresos")
-            top_rev = (daily_filtered.groupby('Producto')['Revenue'].sum()
-                       .sort_values(ascending=False).head(10).reset_index())
-            f_rev = px.bar(top_rev, x='Revenue', y='Producto', orientation='h',
-                           color='Revenue', color_continuous_scale='Blues',
-                           labels={'Revenue': 'Ingresos (€)', 'Producto': ''})
-            f_rev.update_traces(hovertemplate='<b>%{y}</b><br>%{x:,.0f} €<extra></extra>')
-            if sel_product and sel_product in top_rev['Producto'].values:
-                _rev_sorted = top_rev.sort_values('Revenue', ascending=True)['Producto'].tolist()
-                _sp_rev_idx = _rev_sorted.index(sel_product)
-                f_rev.add_shape(type='rect', xref='paper', x0=0, x1=1,
-                                yref='y', y0=_sp_rev_idx - 0.45, y1=_sp_rev_idx + 0.45,
-                                fillcolor='rgba(255,183,0,0.25)',
-                                line=dict(color='#F57F17', width=1.5), layer='below')
-            styled_fig(f_rev, height=400, showlegend=False, coloraxis_showscale=False,
-                       yaxis={'categoryorder': 'total ascending'},
-                       margin=dict(t=10, b=40, l=10, r=10))
-            st.plotly_chart(f_rev, use_container_width=True)
-        vol_col = col_r
-    else:
-        vol_col = st.container()
-
-    with vol_col:
+    with st.container():
         st.markdown("#### Top 10 SKUs — Volumen")
         top_uni = (daily_filtered.groupby('Producto')['Units'].sum()
                    .sort_values(ascending=False).head(10).reset_index())
