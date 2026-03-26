@@ -10,7 +10,7 @@ import sys
 import urllib.request
 import urllib.error
 
-RENDER_URL = "https://enertex-stock.onrender.com"
+RENDER_URL = "https://enertex-stock-production.up.railway.app"
 
 # Send as a list of items so the server captures per-variant detail in stock_by_sku.
 # Products without real variants use a single entry (no variant_title).

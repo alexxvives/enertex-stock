@@ -18,7 +18,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-RENDER_URL = "https://enertex-stock.onrender.com"
+RENDER_URL = "https://enertex-stock-production.up.railway.app"
 
 # Product name corrections (same as PROD_NAME_MAP in app.py)
 PROD_NAME_MAP = {
