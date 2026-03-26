@@ -38,14 +38,16 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 # ── Configuration ─────────────────────────────────────────────
-BASE_DIR     = Path(__file__).parent
-STOCK_FILE   = BASE_DIR / "amphora_stock.json"
-ORDERS_FILE  = BASE_DIR / "amphora_orders.json"
-RETURNS_FILE = BASE_DIR / "amphora_returns.json"
+BASE_DIR      = Path(__file__).parent
+STOCK_FILE    = BASE_DIR / "amphora_stock.json"
+ORDERS_FILE   = BASE_DIR / "amphora_orders.json"
+RETURNS_FILE  = BASE_DIR / "amphora_returns.json"
+FULFILLED_FILE = BASE_DIR / "amphora_fulfilled.json"
 
 AMPHORA_SECRET = os.environ.get("AMPHORA_SECRET", "")
 SHOPIFY_TOKEN  = os.environ.get("SHOPIFY_TOKEN", "")
 SHOPIFY_SHOP   = os.environ.get("SHOPIFY_SHOP", "frnr50-hx.myshopify.com")
+HOLDED_API_KEY = os.environ.get("HOLDED_API_KEY", "")
 
 app = FastAPI(title="Enertex · Amphora Bridge", version="1.0")
 
@@ -372,6 +374,87 @@ async def orders_log():
     return JSONResponse({"count": 0, "events": []})
 
 
+# ── POST /fulfilled-orders  ◄── AMPHORA PUSHES COMPLETED SHIPMENTS ───────────
+@app.post("/fulfilled-orders")
+async def receive_fulfilled_orders(
+    request: Request,
+    x_secret: Optional[str] = Header(None, alias="x-secret"),
+):
+    """
+    Amphora POSTs completed/shipped orders here.
+    Each entry is stored with a timestamp. The dashboard reads /sales-history
+    to compute per-SKU daily sales velocity without needing data.xlsx.
+
+    Expected payload (list or wrapping dict):
+      [{"order_id": "...", "fulfilled_at": "2026-03-25", "line_items": [
+          {"product_title": "SPIRO Card", "variant_title": "Azul",
+           "sku": "SC-AZL", "quantity": 2}
+      ]}, ...]
+    """
+    _verify(x_secret)
+    raw: Any = await request.json()
+    items: list = raw if isinstance(raw, list) else raw.get("orders", raw.get("items", []))
+    existing: list = []
+    if FULFILLED_FILE.exists():
+        try:
+            existing = json.loads(FULFILLED_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+    if not isinstance(existing, list):
+        existing = []
+    existing_ids = {str(e.get("order_id", "")) for e in existing}
+    added = 0
+    for order in items:
+        oid = str(order.get("order_id", ""))
+        if oid and oid in existing_ids:
+            continue
+        existing.append(order)
+        added += 1
+    existing = existing[-10_000:]
+    FULFILLED_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+    return {"status": "ok", "added": added, "total_stored": len(existing)}
+
+
+# ── GET /sales-history  ◄── STREAMLIT READS FOR VELOCITY ─────────────────────
+@app.get("/sales-history")
+async def sales_history():
+    """
+    Returns fulfilled orders aggregated as daily per-SKU/variant units sold.
+    Streamlit uses this to compute Avg_Daily_Sales from Amphora shipment data
+    instead of the static data.xlsx.
+
+    Response: { "daily": [{"date":"2026-03-25","product":"SPIRO Card",
+                            "variant":"Azul","units":3},...],
+                "order_count": N }
+    """
+    if not FULFILLED_FILE.exists():
+        return JSONResponse({"daily": [], "order_count": 0})
+    try:
+        orders: list = json.loads(FULFILLED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return JSONResponse({"daily": [], "order_count": 0})
+
+    agg: dict[tuple, int] = {}
+    for order in orders:
+        date_raw = order.get("fulfilled_at") or order.get("created_at") or ""
+        date = date_raw[:10] if date_raw else ""
+        for li in order.get("line_items", []):
+            prod    = li.get("product_title") or li.get("title") or li.get("name") or ""
+            variant = li.get("variant_title") or li.get("variant") or ""
+            if variant.lower() in ("default title", "default"):
+                variant = ""
+            qty = int(li.get("quantity", 0))
+            if prod and date:
+                key = (date, prod, variant)
+                agg[key] = agg.get(key, 0) + qty
+
+    daily = [
+        {"date": k[0], "product": k[1], "variant": k[2], "units": v}
+        for k, v in sorted(agg.items())
+    ]
+    return JSONResponse({"daily": daily, "order_count": len(orders)})
+
+
 # ── Health check ──────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -387,14 +470,22 @@ async def health():
             order_count = len(json.loads(ORDERS_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
+    fulfilled_count = 0
+    if FULFILLED_FILE.exists():
+        try:
+            fulfilled_count = len(json.loads(FULFILLED_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
     return {
-        "status":              "ok",
-        "secret_configured":   bool(AMPHORA_SECRET),
-        "shopify_configured":  bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
-        "stock_last_updated":  src.get("updated_at"),
-        "stock_products":      len(src.get("stock", {})),
-        "stock_variants":      len(src.get("stock_by_sku", [])),
-        "order_events_stored": order_count,
+        "status":                "ok",
+        "secret_configured":     bool(AMPHORA_SECRET),
+        "holded_configured":     bool(HOLDED_API_KEY),
+        "shopify_configured":    bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
+        "stock_last_updated":    src.get("updated_at"),
+        "stock_products":        len(src.get("stock", {})),
+        "stock_variants":        len(src.get("stock_by_sku", [])),
+        "order_events_stored":   order_count,
+        "fulfilled_orders_stored": fulfilled_count,
     }
 
 

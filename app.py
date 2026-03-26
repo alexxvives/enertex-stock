@@ -605,17 +605,22 @@ def load_all():
         _stock_map = ACTUAL_STOCK
 
     # Inject any products that exist in stock but have no sales history.
-    # Variant rows ("Product - Variant") inherit their parent's velocity so that
-    # Days_of_Stock shows how long THAT colour can cover total product demand.
+    # Variant rows ("Product - Variant") inherit their parent's velocity split equally
+    # across all known variants of that product (velocity / n_variants per product).
     _parent_velocity = sku_stats.set_index('Producto')['Avg_Daily_Sales'].to_dict()
     _parent_std      = sku_stats.set_index('Producto')['Std_Daily_Sales'].to_dict()
+    # Count how many variants each parent product has in the stock map
+    _variant_counts: dict[str, int] = {}
+    for _vk, _vp in _variant_parent.items():
+        _variant_counts[_vp] = _variant_counts.get(_vp, 0) + 1
     _known_skus = set(sku_stats['Producto'])
     _extra_rows = []
     for _pname, _qty in _stock_map.items():
         if _pname not in _known_skus:
             _par = _variant_parent.get(_pname, '')
-            _vel = _parent_velocity.get(_par, 0.0) if _par else 0.0
-            _std = _parent_std.get(_par, 0.0) if _par else 0.0
+            _n   = max(_variant_counts.get(_par, 1), 1) if _par else 1
+            _vel = _parent_velocity.get(_par, 0.0) / _n if _par else 0.0
+            _std = _parent_std.get(_par, 0.0) / _n if _par else 0.0
             _extra_rows.append({'Producto': _pname, 'Total_Units': 0,
                                  'Total_Revenue': 0.0, 'Avg_Daily_Sales': _vel,
                                  'Std_Daily_Sales': _std, 'Safety_Stock': 0.0,
