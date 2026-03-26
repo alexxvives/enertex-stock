@@ -588,6 +588,23 @@ def load_all():
 
     if _stock_map is None:
         _stock_map = ACTUAL_STOCK
+
+    # Inject any products that exist in stock but have no sales history.
+    # They'll appear in the chart with their stock qty but 0 sales velocity,
+    # showing as ST_CRITICAL (stock but unknown demand).
+    _known_skus = set(sku_stats['Producto'])
+    _extra_rows = []
+    for _pname, _qty in _stock_map.items():
+        if _pname not in _known_skus:
+            _extra_rows.append({'Producto': _pname, 'Total_Units': 0,
+                                 'Total_Revenue': 0.0, 'Avg_Daily_Sales': 0.0,
+                                 'Std_Daily_Sales': 0.0, 'Safety_Stock': 0.0,
+                                 'LT_Demand': 0.0, 'Reseller_LT_Buffer': 0.0,
+                                 'Reseller_Demand_30d': 0.0, 'Reorder_Point': 0.0})
+    if _extra_rows:
+        sku_stats = pd.concat([sku_stats, pd.DataFrame(_extra_rows)],
+                               ignore_index=True)
+
     sku_stats['Stock'] = sku_stats['Producto'].map(_stock_map).fillna(0)
     sku_stats['Below_ROP'] = sku_stats['Stock'] < sku_stats['Reorder_Point']
 
