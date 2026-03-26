@@ -427,68 +427,99 @@ def _render_prophet_chart(fc_df, act_w, height=450):
 
 
 # ──────────────────────────────────────────────────────────────
-#  CARGA DE DATOS — totalmente autónomo desde Excel
+#  CARGA DE DATOS — Amphora /sales-history (live) → data.xlsx (fallback)
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Cargando datos…")
 def load_all():
-    """Carga y calcula todo desde data.xlsx. Devuelve (daily, proc, curves, comp)."""
+    """Carga y calcula todo. Fuente primaria: Amphora /sales-history. Fallback: data.xlsx."""
+    import json as _json
     base = os.path.dirname(os.path.abspath(__file__))
 
-    # ── 1. Load raw sales from Excel and apply all cleaning transforms ──
-    #        • filter to SPIRO + BBL business lines, exclude B2B and logistics rows
-    #        • explode bulb packs into per-unit rows (price-per-unit heuristic)
-    #        • explode product packs into their component SKUs
-    #        • flag reseller rows for separate buffer calculation
-    raw = pd.read_excel(os.path.join(base, 'data.xlsx'),
-                        sheet_name='BDD (Management Accounts)')
-    raw['Fecha'] = pd.to_datetime(raw['Fecha'], errors='coerce')
-    raw = raw[raw['Servicio'] != 'B2B'].copy()
-    bl = raw['Business line'].str.strip().str.lower()
-    raw = raw[bl.isin({'spiro', 'bbl', 'block blue light'})].copy()
-    raw = raw[~raw['Producto'].isin(EXCLUDE_PRODUCTS)].copy()
-    raw = raw[(raw['Unidades'] > 0) & (raw['D-C'] < 0)].copy()
-    raw = raw[raw['Fecha'] >= '2023-01-01'].copy()
-    raw['Producto'] = raw['Producto'].replace(PROD_NAME_MAP)
+    # ── 1a. Try Amphora /sales-history first ──────────────────────────────────
+    #   Returns daily rows: [{date, product, variant, units}]
+    #   This covers ALL channels Amphora fulfils (D2C + B2B/resellers).
+    _webhook_url = (st.secrets.get("AMPHORA_WEBHOOK_URL") or
+                    os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
+    _amphora_daily = None
+    if _webhook_url:
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(f"{_webhook_url}/sales-history", timeout=15) as _r:
+                _sh = _json.loads(_r.read())
+            if _sh.get("daily"):
+                _rows = []
+                for _e in _sh["daily"]:
+                    _prod = PROD_NAME_MAP.get(_e["product"], _e["product"])
+                    _var  = _e.get("variant", "")
+                    # Include variant in product name when present
+                    _label = f"{_prod} - {_var}" if _var else _prod
+                    _rows.append({"Date": pd.to_datetime(_e["date"]),
+                                  "Producto": _label,
+                                  "Units": int(_e["units"]),
+                                  "Revenue": 0.0,
+                                  "Is_Reseller": False})
+                if _rows:
+                    _amphora_daily = pd.DataFrame(_rows)
+        except Exception:
+            _amphora_daily = None
 
-    # Bombillas → unidades reales
-    bulb_mask = raw['Producto'].isin(BULB_CANON)
-    bulb = raw[bulb_mask].copy()
-    rest = raw[~bulb_mask].copy()
-    if len(bulb):
-        bulb['_pp'] = bulb['D-C'].abs() / bulb['Unidades']
-        bulb['_m']  = bulb['_pp'].apply(lambda p: 6 if p >= 70 else (3 if p >= 30 else 1))
-        bulb['Unidades'] = bulb['Unidades'] * bulb['_m']
-        bulb['Producto'] = bulb['Producto'].map(BULB_CANON)
-        bulb.drop(columns=['_pp', '_m'], inplace=True)
-    raw = pd.concat([rest, bulb], ignore_index=True)
+    # ── 1b. Fall back to data.xlsx if Amphora has no history yet ─────────────
+    _xlsx_path = os.path.join(base, 'data.xlsx')
+    _using_amphora = _amphora_daily is not None and len(_amphora_daily) > 0
 
-    # Packs → componentes
-    pack_mask = raw['Producto'].isin(set(PACK_COMPONENTS))
-    packs = raw[pack_mask].copy()
-    nopack = raw[~pack_mask].copy()
-    comp_rows = []
-    for _, row in packs.iterrows():
-        _pack_total_qty = sum(PACK_COMPONENTS[row['Producto']].values())
-        for comp, qty in PACK_COMPONENTS[row['Producto']].items():
-            r = row.copy(); r['Producto'] = comp
-            r['Unidades'] = row['Unidades'] * qty
-            # Revenue distributed pro-rata by unit count
-            # (pack price = sum of individual unit prices, so each component
-            # receives its proportional share of the total pack revenue)
-            r['D-C'] = row['D-C'] * qty / _pack_total_qty if _pack_total_qty else 0.0
-            comp_rows.append(r)
-    raw = pd.concat([nopack] + ([pd.DataFrame(comp_rows)] if comp_rows else []),
-                     ignore_index=True)
+    if _using_amphora:
+        daily      = (_amphora_daily.groupby(['Date', 'Producto'])
+                      .agg(Units=('Units', 'sum'), Revenue=('Revenue', 'sum'))
+                      .reset_index())
+        sales_all  = _amphora_daily.copy()
+    else:
+        # ── Load raw sales from Excel ──────────────────────────────────────
+        raw = pd.read_excel(_xlsx_path, sheet_name='BDD (Management Accounts)')
+        raw['Fecha'] = pd.to_datetime(raw['Fecha'], errors='coerce')
+        raw = raw[raw['Servicio'] != 'B2B'].copy()
+        bl = raw['Business line'].str.strip().str.lower()
+        raw = raw[bl.isin({'spiro', 'bbl', 'block blue light'})].copy()
+        raw = raw[~raw['Producto'].isin(EXCLUDE_PRODUCTS)].copy()
+        raw = raw[(raw['Unidades'] > 0) & (raw['D-C'] < 0)].copy()
+        raw = raw[raw['Fecha'] >= '2023-01-01'].copy()
+        raw['Producto'] = raw['Producto'].replace(PROD_NAME_MAP)
 
-    raw['Is_Reseller'] = raw['Cliente / reseller'].str.strip().str.lower() == 'reseller'
-    sales_all = raw.copy()
-    sales = raw[~raw['Is_Reseller']].copy()
+        # Bombillas → unidades reales
+        bulb_mask = raw['Producto'].isin(BULB_CANON)
+        bulb = raw[bulb_mask].copy()
+        rest = raw[~bulb_mask].copy()
+        if len(bulb):
+            bulb['_pp'] = bulb['D-C'].abs() / bulb['Unidades']
+            bulb['_m']  = bulb['_pp'].apply(lambda p: 6 if p >= 70 else (3 if p >= 30 else 1))
+            bulb['Unidades'] = bulb['Unidades'] * bulb['_m']
+            bulb['Producto'] = bulb['Producto'].map(BULB_CANON)
+            bulb.drop(columns=['_pp', '_m'], inplace=True)
+        raw = pd.concat([rest, bulb], ignore_index=True)
 
-    daily = (sales.groupby([sales['Fecha'].dt.date.rename('Date'), 'Producto'])
-             .agg(Units=('Unidades', 'sum'), Revenue=('D-C', 'sum'))
-             .reset_index())
-    daily['Date'] = pd.to_datetime(daily['Date'])
-    daily['Revenue'] = daily['Revenue'].abs()
+        # Packs → componentes
+        pack_mask = raw['Producto'].isin(set(PACK_COMPONENTS))
+        packs = raw[pack_mask].copy()
+        nopack = raw[~pack_mask].copy()
+        comp_rows = []
+        for _, row in packs.iterrows():
+            _pack_total_qty = sum(PACK_COMPONENTS[row['Producto']].values())
+            for comp, qty in PACK_COMPONENTS[row['Producto']].items():
+                r = row.copy(); r['Producto'] = comp
+                r['Unidades'] = row['Unidades'] * qty
+                r['D-C'] = row['D-C'] * qty / _pack_total_qty if _pack_total_qty else 0.0
+                comp_rows.append(r)
+        raw = pd.concat([nopack] + ([pd.DataFrame(comp_rows)] if comp_rows else []),
+                         ignore_index=True)
+
+        raw['Is_Reseller'] = raw['Cliente / reseller'].str.strip().str.lower() == 'reseller'
+        sales_all = raw.copy()
+        sales = raw[~raw['Is_Reseller']].copy()
+
+        daily = (sales.groupby([sales['Fecha'].dt.date.rename('Date'), 'Producto'])
+                 .agg(Units=('Unidades', 'sum'), Revenue=('D-C', 'sum'))
+                 .reset_index())
+        daily['Date'] = pd.to_datetime(daily['Date'])
+        daily['Revenue'] = daily['Revenue'].abs()
 
     # ── 2. Compute inventory metrics per SKU ──
     #  All rolling metrics use the same STATS_WINDOW_DAYS-day window so that
@@ -527,15 +558,19 @@ def load_all():
     sku_stats['LT_Demand']    = sku_stats['Avg_Daily_Sales'] * LEAD_TIME_DAYS
 
     # Buffer revendedor
-    res = sales_all[sales_all['Is_Reseller']].copy()
-    res['Date'] = pd.to_datetime(res['Fecha']).dt.date
+    # When using Amphora data all shipments are already included in velocity
+    # (Amphora ships D2C + B2B), so no separate reseller buffer is needed.
+    if not _using_amphora and 'Is_Reseller' in sales_all.columns:
+        res = sales_all[sales_all['Is_Reseller']].copy()
+        res['Date'] = pd.to_datetime(res['Fecha']).dt.date
+    else:
+        res = pd.DataFrame()
     if len(res):
         n_months = max(1, (pd.to_datetime(res['Date'].max()) -
                            pd.to_datetime(res['Date'].min())).days / 30)
         res_daily = res.groupby('Producto')['Unidades'].sum() / n_months / 30
         sku_stats['Reseller_LT_Buffer'] = (sku_stats['Producto']
                                             .map(res_daily).fillna(0) * LEAD_TIME_DAYS)
-        # Forward-looking reseller demand for next 30 days (same avg-daily rate)
         sku_stats['Reseller_Demand_30d'] = (sku_stats['Producto']
                                              .map(res_daily).fillna(0) * 30)
     else:
@@ -680,15 +715,16 @@ def load_all():
     except Exception:
         pass
 
-    return daily, sku_stats, curves, comp
+    return daily, sku_stats, curves, comp, _using_amphora
 
 
 # ──────────────────────────────────────────────────────────────
 try:
-    daily, proc, forecast_curves, model_comp = load_all()
+    daily, proc, forecast_curves, model_comp, _data_from_amphora = load_all()
 except FileNotFoundError:
-    st.error("No se encontró **data.xlsx** en el directorio. "
-             "Coloca el archivo y recarga la página.")
+    st.error("No se encontró **data.xlsx** y Amphora aún no tiene historial. "
+             "Sube el archivo data.xlsx o ejecuta `python backfill_fulfilled.py` "
+             "para sembrar el historial en Amphora.")
     st.stop()
 
 has_ml = forecast_curves is not None and len(forecast_curves) > 0
@@ -843,28 +879,34 @@ with tab1:
         margin=dict(t=20, b=50, l=60, r=20))
     st.plotly_chart(fig1, use_container_width=True)
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("#### Top 10 SKUs — Ingresos")
-        top_rev = (daily_filtered.groupby('Producto')['Revenue'].sum()
-                   .sort_values(ascending=False).head(10).reset_index())
-        f_rev = px.bar(top_rev, x='Revenue', y='Producto', orientation='h',
-                       color='Revenue', color_continuous_scale='Blues',
-                       labels={'Revenue': 'Ingresos (€)', 'Producto': ''})
-        f_rev.update_traces(hovertemplate='<b>%{y}</b><br>%{x:,.0f} €<extra></extra>')
-        if sel_product and sel_product in top_rev['Producto'].values:
-            _rev_sorted = top_rev.sort_values('Revenue', ascending=True)['Producto'].tolist()
-            _sp_rev_idx = _rev_sorted.index(sel_product)
-            f_rev.add_shape(type='rect', xref='paper', x0=0, x1=1,
-                            yref='y', y0=_sp_rev_idx - 0.45, y1=_sp_rev_idx + 0.45,
-                            fillcolor='rgba(255,183,0,0.25)',
-                            line=dict(color='#F57F17', width=1.5), layer='below')
-        styled_fig(f_rev, height=400, showlegend=False, coloraxis_showscale=False,
-                   yaxis={'categoryorder': 'total ascending'},
-                   margin=dict(t=10, b=40, l=10, r=10))
-        st.plotly_chart(f_rev, use_container_width=True)
+    _has_revenue = daily_filtered['Revenue'].sum() > 0
 
-    with col_r:
+    if _has_revenue:
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("#### Top 10 SKUs — Ingresos")
+            top_rev = (daily_filtered.groupby('Producto')['Revenue'].sum()
+                       .sort_values(ascending=False).head(10).reset_index())
+            f_rev = px.bar(top_rev, x='Revenue', y='Producto', orientation='h',
+                           color='Revenue', color_continuous_scale='Blues',
+                           labels={'Revenue': 'Ingresos (€)', 'Producto': ''})
+            f_rev.update_traces(hovertemplate='<b>%{y}</b><br>%{x:,.0f} €<extra></extra>')
+            if sel_product and sel_product in top_rev['Producto'].values:
+                _rev_sorted = top_rev.sort_values('Revenue', ascending=True)['Producto'].tolist()
+                _sp_rev_idx = _rev_sorted.index(sel_product)
+                f_rev.add_shape(type='rect', xref='paper', x0=0, x1=1,
+                                yref='y', y0=_sp_rev_idx - 0.45, y1=_sp_rev_idx + 0.45,
+                                fillcolor='rgba(255,183,0,0.25)',
+                                line=dict(color='#F57F17', width=1.5), layer='below')
+            styled_fig(f_rev, height=400, showlegend=False, coloraxis_showscale=False,
+                       yaxis={'categoryorder': 'total ascending'},
+                       margin=dict(t=10, b=40, l=10, r=10))
+            st.plotly_chart(f_rev, use_container_width=True)
+        vol_col = col_r
+    else:
+        vol_col = st
+
+    with vol_col:
         st.markdown("#### Top 10 SKUs — Volumen")
         top_uni = (daily_filtered.groupby('Producto')['Units'].sum()
                    .sort_values(ascending=False).head(10).reset_index())
