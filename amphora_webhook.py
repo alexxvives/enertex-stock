@@ -1,28 +1,33 @@
 """
 Amphora Logistics — Webhook/API bridge
 =======================================
-Deploy on Railway (https://railway.app) — gives a public HTTPS URL.
+Deployed on Render.com (https://render.com) — public HTTPS URL.
 
-Railway start command:
+Render start command:
     uvicorn amphora_webhook:app --host 0.0.0.0 --port $PORT
 
 In Amphora's "Integrate store" form set:
   X-Secret          → value of AMPHORA_SECRET env var
-  ORDERS            → GET  https://<railway-url>/orders
-  PRODUCTS          → GET  https://<railway-url>/products
-  ORDER STATUS      → POST https://<railway-url>/order-status
-  STOCK             → POST https://<railway-url>/stock       ← live inventory
-  STATUS OF A RETURN→ POST https://<railway-url>/return-status
+  ORDERS            → GET  https://enertex-stock.onrender.com/orders
+  PRODUCTS          → GET  https://enertex-stock.onrender.com/products
+  ORDER STATUS      → POST https://enertex-stock.onrender.com/order-status
+  STOCK             → POST https://enertex-stock.onrender.com/stock
+  STATUS OF A RETURN→ POST https://enertex-stock.onrender.com/return-status
 
 Streamlit Cloud reads live stock via:
-  GET https://<railway-url>/current-stock   (no auth required)
-  Set AMPHORA_WEBHOOK_URL=https://<railway-url> in Streamlit Cloud secrets.
+  GET https://enertex-stock.onrender.com/current-stock   (no auth required)
+  Set AMPHORA_WEBHOOK_URL=https://enertex-stock.onrender.com in Streamlit Cloud secrets.
 
 Environment variables:
   AMPHORA_SECRET       — X-Secret shared with Amphora (required)
   SHOPIFY_TOKEN        — Shopify Admin API token (optional)
   SHOPIFY_SHOP         — e.g. frnr50-hx.myshopify.com
-  PORT                 — set automatically by Railway
+  PORT                 — set automatically by Render
+
+NOTE: Render free tier has ephemeral disk — JSON files are wiped on every
+deploy. After any git push to Render, re-run:
+  python backfill_fulfilled.py <secret>   # restore sales history
+  python seed_stock.py <secret>           # restore stock levels
 """
 
 import json
@@ -51,8 +56,9 @@ HOLDED_API_KEY = os.environ.get("HOLDED_API_KEY", "")
 
 app = FastAPI(title="Enertex · Amphora Bridge", version="1.0")
 
-# In-memory stock cache — survives restarts (Railway keeps process alive);
-# also written to disk so it survives redeploys if a volume is mounted.
+# In-memory stock cache — survives process restarts.
+# Also written to disk (amphora_stock.json) — note: Render free tier has
+# ephemeral disk, so the file is wiped on redeployment. Re-seed after deploys.
 _stock_cache: dict[str, Any] = {}
 
 

@@ -429,7 +429,7 @@ def _render_prophet_chart(fc_df, act_w, height=450):
 # ──────────────────────────────────────────────────────────────
 #  CARGA DE DATOS — Amphora /sales-history (live) → data.xlsx (fallback)
 # ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Cargando datos…")
+@st.cache_data(show_spinner="Cargando datos…", ttl=3600)
 def load_all():
     """Carga y calcula todo. Fuente primaria: Amphora /sales-history. Fallback: data.xlsx."""
     import json as _json
@@ -908,7 +908,7 @@ with tab1:
             st.plotly_chart(f_rev, use_container_width=True)
         vol_col = col_r
     else:
-        vol_col = st
+        vol_col = st.container()
 
     with vol_col:
         st.markdown("#### Top 10 SKUs — Volumen")
