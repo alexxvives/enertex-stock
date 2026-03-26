@@ -474,63 +474,16 @@ def load_all():
         except Exception:
             _amphora_daily = None
 
-    # ── 1b. Fall back to data.xlsx if Amphora has no history yet ─────────────
-    _xlsx_path = os.path.join(base, 'data.xlsx')
+    # ── 1b. Require Amphora data — no Excel fallback ──────────────────────────
     _using_amphora = _amphora_daily is not None and len(_amphora_daily) > 0
 
-    if _using_amphora:
-        daily      = (_amphora_daily.groupby(['Date', 'Producto'])
-                      .agg(Units=('Units', 'sum'), Revenue=('Revenue', 'sum'))
-                      .reset_index())
-        sales_all  = _amphora_daily.copy()
-    else:
-        # ── Load raw sales from Excel ──────────────────────────────────────
-        raw = pd.read_excel(_xlsx_path, sheet_name='BDD (Management Accounts)')
-        raw['Fecha'] = pd.to_datetime(raw['Fecha'], errors='coerce')
-        raw = raw[raw['Servicio'] != 'B2B'].copy()
-        bl = raw['Business line'].str.strip().str.lower()
-        raw = raw[bl.isin({'spiro', 'bbl', 'block blue light'})].copy()
-        raw = raw[~raw['Producto'].isin(EXCLUDE_PRODUCTS)].copy()
-        raw = raw[(raw['Unidades'] > 0) & (raw['D-C'] < 0)].copy()
-        raw = raw[raw['Fecha'] >= '2023-01-01'].copy()
-        raw['Producto'] = raw['Producto'].replace(PROD_NAME_MAP)
+    if not _using_amphora:
+        raise RuntimeError("Amphora sin historial")
 
-        # Bombillas → unidades reales
-        bulb_mask = raw['Producto'].isin(BULB_CANON)
-        bulb = raw[bulb_mask].copy()
-        rest = raw[~bulb_mask].copy()
-        if len(bulb):
-            bulb['_pp'] = bulb['D-C'].abs() / bulb['Unidades']
-            bulb['_m']  = bulb['_pp'].apply(lambda p: 6 if p >= 70 else (3 if p >= 30 else 1))
-            bulb['Unidades'] = bulb['Unidades'] * bulb['_m']
-            bulb['Producto'] = bulb['Producto'].map(BULB_CANON)
-            bulb.drop(columns=['_pp', '_m'], inplace=True)
-        raw = pd.concat([rest, bulb], ignore_index=True)
-
-        # Packs → componentes
-        pack_mask = raw['Producto'].isin(set(PACK_COMPONENTS))
-        packs = raw[pack_mask].copy()
-        nopack = raw[~pack_mask].copy()
-        comp_rows = []
-        for _, row in packs.iterrows():
-            _pack_total_qty = sum(PACK_COMPONENTS[row['Producto']].values())
-            for comp, qty in PACK_COMPONENTS[row['Producto']].items():
-                r = row.copy(); r['Producto'] = comp
-                r['Unidades'] = row['Unidades'] * qty
-                r['D-C'] = row['D-C'] * qty / _pack_total_qty if _pack_total_qty else 0.0
-                comp_rows.append(r)
-        raw = pd.concat([nopack] + ([pd.DataFrame(comp_rows)] if comp_rows else []),
-                         ignore_index=True)
-
-        raw['Is_Reseller'] = raw['Cliente / reseller'].str.strip().str.lower() == 'reseller'
-        sales_all = raw.copy()
-        sales = raw[~raw['Is_Reseller']].copy()
-
-        daily = (sales.groupby([sales['Fecha'].dt.date.rename('Date'), 'Producto'])
-                 .agg(Units=('Unidades', 'sum'), Revenue=('D-C', 'sum'))
+    daily     = (_amphora_daily.groupby(['Date', 'Producto'])
+                 .agg(Units=('Units', 'sum'), Revenue=('Revenue', 'sum'))
                  .reset_index())
-        daily['Date'] = pd.to_datetime(daily['Date'])
-        daily['Revenue'] = daily['Revenue'].abs()
+    sales_all = _amphora_daily.copy()
 
     # ── 2. Compute inventory metrics per SKU ──
     #  All rolling metrics use the same STATS_WINDOW_DAYS-day window so that
@@ -744,10 +697,9 @@ def load_all():
 # ──────────────────────────────────────────────────────────────
 try:
     daily, proc, forecast_curves, model_comp, _data_from_amphora, _stock_source = load_all()
-except FileNotFoundError:
-    st.error("No se encontró **data.xlsx** y Amphora aún no tiene historial. "
-             "Sube el archivo data.xlsx o ejecuta `python backfill_fulfilled.py` "
-             "para sembrar el historial en Amphora.")
+except (FileNotFoundError, RuntimeError):
+    st.error("Amphora todavía no tiene historial de ventas. "
+             "Ejecuta `python backfill_fulfilled.py` para sembrar el historial.")
     st.stop()
 
 has_ml = forecast_curves is not None and len(forecast_curves) > 0
@@ -811,7 +763,7 @@ with st.sidebar:
         "hardcoded":     ("hardcoded (Render inactivo)", "#E65100"),
     }
     _stock_label, _stock_color = _src_map.get(_stock_source, ("desconocido", "#E65100"))
-    _sales_label = "Amphora ✓" if _data_from_amphora else "data.xlsx"
+    _sales_label = "Amphora ✓"
     _sales_color = "#2E7D32"   if _data_from_amphora else "#1565C0"
     st.markdown(
         f"<div style='font-size:0.78rem;color:#78909C;'>"
