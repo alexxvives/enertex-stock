@@ -166,6 +166,13 @@ PROD_NAME_MAP = {
                                         'Protector de Pantalla Anti Luz Azul',
     'Protector de Pantalla Anti Luz Azul - Iphone 15 Plus / 15 Pro Max':
                                         'Protector de Pantalla Anti Luz Azul',
+    'Full Spectrum Bulb':               'BioLight™ - Full Spectrum Bulb',
+    'Pack Full Spectrum Bulb':          'BioLight™ - Full Spectrum Bulb',
+    'Pack Ruby Light Bulb':             'Ruby Light Bulb',
+    'Pack Ruby Light Bulb 1 Unidad':    'Ruby Light Bulb',
+    'Pack Amber Light Bulb':            'Amber Light Bulb',
+    'Pack Amber Light Bulb 1unidad':    'Amber Light Bulb',
+    'Amber Light Bulb VENTA AFILIADO':  'Amber Light Bulb',
 }
 
 ACTUAL_STOCK = {
@@ -553,9 +560,12 @@ def load_all():
     if _webhook_url:
         try:
             import urllib.request as _ur
-            with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=4) as _resp:
+            # First attempt — Render free tier may be sleeping (needs ~30s to wake).
+            # Try once with a generous timeout; a sleeping instance returns no data
+            # so we fall through to stock.xlsx automatically on failure.
+            with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=15) as _resp:
                 _d = _json.loads(_resp.read())
-            if isinstance(_d.get("stock"), dict):
+            if isinstance(_d.get("stock"), dict) and _d["stock"]:
                 _stock_map = _d["stock"]
         except Exception:
             _stock_map = None   # fall through to next source
