@@ -582,27 +582,27 @@ def load_all():
                                   sku_stats['Reseller_LT_Buffer'])
 
     # Stock priority:
-    #   1) Amphora Railway webhook  (AMPHORA_WEBHOOK_URL env var)
-    #   2) amphora_stock.json       (local / Railway disk)
+    #   1) Amphora Render webhook   (AMPHORA_WEBHOOK_URL env var)
+    #   2) amphora_stock.json       (local / Render disk)
     #   3) stock.xlsx               (manually maintained)
     #   4) hardcoded ACTUAL_STOCK   (fallback)
     import json as _json
     _webhook_url  = (st.secrets.get("AMPHORA_WEBHOOK_URL") or os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
     _amphora_json = os.path.join(base, 'amphora_stock.json')
     _stock_file   = os.path.join(base, 'stock.xlsx')
-    _stock_map     = None
+    _stock_map      = None
+    _stock_source   = "hardcoded"  # will be updated below to reflect the real source used
     _variant_parent = {}   # maps "Product - Variant" → "Product" for velocity inheritance
 
     if _webhook_url:
         try:
             import urllib.request as _ur
-            # First attempt — Render free tier may be sleeping (needs ~30s to wake).
-            # Try once with a generous timeout; a sleeping instance returns no data
-            # so we fall through to stock.xlsx automatically on failure.
+            # Render free tier may be sleeping — fall through to next source on failure.
             with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=15) as _resp:
                 _d = _json.loads(_resp.read())
             if isinstance(_d.get("stock"), dict) and _d["stock"]:
                 _stock_map = dict(_d["stock"])  # copy so we can extend with variants
+                _stock_source = "amphora_live"
                 for _item in _d.get("stock_by_sku", []):
                     _prod = _item.get("product", "")
                     _var  = _item.get("variant", "")
@@ -619,6 +619,7 @@ def load_all():
             _stock_map = dict(_d.get('stock') or _d)
             if not isinstance(_stock_map, dict):
                 raise ValueError
+            _stock_source = "amphora_json"
             for _item in _d.get("stock_by_sku", []):
                 _prod = _item.get("product", "")
                 _var  = _item.get("variant", "")
@@ -633,11 +634,13 @@ def load_all():
         try:
             _stock_df  = pd.read_excel(_stock_file)
             _stock_map = dict(zip(_stock_df['Producto'], _stock_df['Stock']))
+            _stock_source = "stock_xlsx"
         except Exception:
             _stock_map = None
 
     if _stock_map is None:
         _stock_map = ACTUAL_STOCK
+        # _stock_source stays "hardcoded"
 
     # Inject any products that exist in stock but have no sales history.
     # Variant rows ("Product - Variant") inherit their parent's velocity split equally
@@ -666,6 +669,15 @@ def load_all():
                                ignore_index=True)
 
     sku_stats['Stock'] = sku_stats['Producto'].map(_stock_map).fillna(0)
+
+    # When per-variant rows were injected (e.g. "SPIRO Card - Azul" / "Blanca"),
+    # drop the parent-level row to avoid showing it twice with the summed stock.
+    _parents_with_variants = set(_variant_parent.values())
+    if _parents_with_variants:
+        sku_stats = sku_stats[
+            ~sku_stats['Producto'].isin(_parents_with_variants)
+        ].reset_index(drop=True)
+
     sku_stats['Below_ROP'] = sku_stats['Stock'] < sku_stats['Reorder_Point']
 
     avg_d = sku_stats.set_index('Producto')['Avg_Daily_Sales'].clip(lower=0.001)
@@ -715,12 +727,12 @@ def load_all():
     except Exception:
         pass
 
-    return daily, sku_stats, curves, comp, _using_amphora
+    return daily, sku_stats, curves, comp, _using_amphora, _stock_source
 
 
 # ──────────────────────────────────────────────────────────────
 try:
-    daily, proc, forecast_curves, model_comp, _data_from_amphora = load_all()
+    daily, proc, forecast_curves, model_comp, _data_from_amphora, _stock_source = load_all()
 except FileNotFoundError:
     st.error("No se encontró **data.xlsx** y Amphora aún no tiene historial. "
              "Sube el archivo data.xlsx o ejecuta `python backfill_fulfilled.py` "
@@ -780,31 +792,23 @@ with st.sidebar:
 
     st.divider()
 
-    _base_dir      = os.path.dirname(os.path.abspath(__file__))
-    _amphora_ok    = os.path.exists(os.path.join(_base_dir, 'amphora_stock.json'))
-    _stock_ok      = os.path.exists(os.path.join(_base_dir, 'stock.xlsx'))
-    _webhook_url2  = (st.secrets.get("AMPHORA_WEBHOOK_URL") or os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
-    if _webhook_url2:
-        _stock_label = f"Amphora Railway live ✓"
-        _stock_color = "#2E7D32"
-    elif _amphora_ok:
-        import json as _j2
-        try:
-            _aj = _j2.loads(open(os.path.join(_base_dir, 'amphora_stock.json'), encoding='utf-8').read())
-            _stock_label = f"Amphora live ✓ ({_aj.get('updated_at','')[:16]})"
-            _stock_color = "#2E7D32"
-        except Exception:
-            _stock_label, _stock_color = "amphora_stock.json (error al leer)", "#C62828"
-    elif _stock_ok:
-        _stock_label, _stock_color = "stock.xlsx ✓", "#1565C0"
-    else:
-        _stock_label, _stock_color = "hardcoded (sin fuente en vivo)", "#E65100"
+    # Use the source flags returned by load_all() — reflects what actually happened
+    _src_map = {
+        "amphora_live":  ("Amphora Render live ✓",    "#2E7D32"),
+        "amphora_json":  ("Amphora JSON local ✓",      "#2E7D32"),
+        "stock_xlsx":    ("stock.xlsx ✓",               "#1565C0"),
+        "hardcoded":     ("hardcoded (Render inactivo)", "#E65100"),
+    }
+    _stock_label, _stock_color = _src_map.get(_stock_source, ("desconocido", "#E65100"))
+    _sales_label = "Amphora ✓" if _data_from_amphora else "data.xlsx"
+    _sales_color = "#2E7D32"   if _data_from_amphora else "#1565C0"
     st.markdown(
         f"<div style='font-size:0.78rem;color:#78909C;'>"
         f"Plazo de entrega: <b>{LEAD_TIME_DAYS} días</b> · "
         f"Nivel de servicio: <b>{SERVICE_LEVEL*100:.0f}%</b><br>"
         f"Ventana estadística: <b>{STATS_WINDOW_DAYS} días</b><br>"
-        f"Stock: <b style='color:{_stock_color}'>{_stock_label}</b>"
+        f"Stock: <b style='color:{_stock_color}'>{_stock_label}</b><br>"
+        f"Ventas: <b style='color:{_sales_color}'>{_sales_label}</b>"
         f"</div>",
         unsafe_allow_html=True)
 
