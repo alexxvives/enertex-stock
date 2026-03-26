@@ -555,7 +555,8 @@ def load_all():
     _webhook_url  = (st.secrets.get("AMPHORA_WEBHOOK_URL") or os.environ.get("AMPHORA_WEBHOOK_URL", "")).rstrip("/")
     _amphora_json = os.path.join(base, 'amphora_stock.json')
     _stock_file   = os.path.join(base, 'stock.xlsx')
-    _stock_map    = None
+    _stock_map     = None
+    _variant_parent = {}   # maps "Product - Variant" → "Product" for velocity inheritance
 
     if _webhook_url:
         try:
@@ -566,16 +567,30 @@ def load_all():
             with _ur.urlopen(f"{_webhook_url}/current-stock", timeout=15) as _resp:
                 _d = _json.loads(_resp.read())
             if isinstance(_d.get("stock"), dict) and _d["stock"]:
-                _stock_map = _d["stock"]
+                _stock_map = dict(_d["stock"])  # copy so we can extend with variants
+                for _item in _d.get("stock_by_sku", []):
+                    _prod = _item.get("product", "")
+                    _var  = _item.get("variant", "")
+                    if _prod and _var:
+                        _vkey = f"{_prod} - {_var}"
+                        _stock_map[_vkey] = _item.get("quantity", 0)
+                        _variant_parent[_vkey] = _prod
         except Exception:
             _stock_map = None   # fall through to next source
 
     if _stock_map is None and os.path.exists(_amphora_json):
         try:
             _d = _json.loads(open(_amphora_json, encoding='utf-8').read())
-            _stock_map = _d.get('stock', _d)
+            _stock_map = dict(_d.get('stock') or _d)
             if not isinstance(_stock_map, dict):
                 raise ValueError
+            for _item in _d.get("stock_by_sku", []):
+                _prod = _item.get("product", "")
+                _var  = _item.get("variant", "")
+                if _prod and _var:
+                    _vkey = f"{_prod} - {_var}"
+                    _stock_map[_vkey] = _item.get("quantity", 0)
+                    _variant_parent[_vkey] = _prod
         except Exception:
             _stock_map = None
 
@@ -590,15 +605,20 @@ def load_all():
         _stock_map = ACTUAL_STOCK
 
     # Inject any products that exist in stock but have no sales history.
-    # They'll appear in the chart with their stock qty but 0 sales velocity,
-    # showing as ST_CRITICAL (stock but unknown demand).
+    # Variant rows ("Product - Variant") inherit their parent's velocity so that
+    # Days_of_Stock shows how long THAT colour can cover total product demand.
+    _parent_velocity = sku_stats.set_index('Producto')['Avg_Daily_Sales'].to_dict()
+    _parent_std      = sku_stats.set_index('Producto')['Std_Daily_Sales'].to_dict()
     _known_skus = set(sku_stats['Producto'])
     _extra_rows = []
     for _pname, _qty in _stock_map.items():
         if _pname not in _known_skus:
+            _par = _variant_parent.get(_pname, '')
+            _vel = _parent_velocity.get(_par, 0.0) if _par else 0.0
+            _std = _parent_std.get(_par, 0.0) if _par else 0.0
             _extra_rows.append({'Producto': _pname, 'Total_Units': 0,
-                                 'Total_Revenue': 0.0, 'Avg_Daily_Sales': 0.0,
-                                 'Std_Daily_Sales': 0.0, 'Safety_Stock': 0.0,
+                                 'Total_Revenue': 0.0, 'Avg_Daily_Sales': _vel,
+                                 'Std_Daily_Sales': _std, 'Safety_Stock': 0.0,
                                  'LT_Demand': 0.0, 'Reseller_LT_Buffer': 0.0,
                                  'Reseller_Demand_30d': 0.0, 'Reorder_Point': 0.0})
     if _extra_rows:
