@@ -984,8 +984,10 @@ def load_all():
     _avg_win  = _win_full.groupby('Producto')['Units'].mean().rename('Avg_Daily_Sales')
     # _demand_params routes to: Croston/SBA (intermittent) → STL residual σ
     # (regular+history) → raw σ (short history). Returns (avg, sigma) per SKU.
-    _dp = (_win_full.groupby('Producto')['Units']
-           .apply(lambda s: pd.Series(_demand_params(s), index=['avg', 'sigma'])))
+    _dp_raw = _win_full.groupby('Producto')['Units'].apply(
+        lambda s: _demand_params(s)
+    )
+    _dp = pd.DataFrame(_dp_raw.tolist(), index=_dp_raw.index, columns=['avg', 'sigma'])
     _avg_win = _dp['avg'].rename('Avg_Daily_Sales')
     _std_win = _dp['sigma'].rename('Std_Daily_Sales')
 
