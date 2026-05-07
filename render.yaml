@@ -1,0 +1,35 @@
+# render.yaml — defines the Streamlit dashboard as a Render web service.
+#
+# The existing webhook service (amphora_webhook.py / Procfile) is a separate
+# Render service and is NOT affected by this file.
+#
+# To deploy:
+#   1. Go to https://dashboard.render.com → "New Web Service"
+#   2. Connect your GitHub repo (alexxvives/enertex-stock)
+#   3. Render will detect this file automatically.
+#   4. Add the five environment variables listed below (mark them as Secret).
+
+services:
+  - type: web
+    name: enertex-stock-app
+    runtime: python
+    region: oregon
+    plan: free
+
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "bash start.sh"
+
+    # Health-check — Render uses this to know when the service is up.
+    healthCheckPath: /_stcore/health
+
+    envVars:
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false          # set manually in Render dashboard (never committed)
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false
+      - key: AMPHORA_API_KEY
+        sync: false
+      - key: AMPHORA_COMPANY_ID
+        sync: false
+      - key: AMPHORA_WEBHOOK_URL
+        sync: false
