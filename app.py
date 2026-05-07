@@ -1295,18 +1295,9 @@ with st.sidebar:
             f'</span>', unsafe_allow_html=True)
     st.divider()
 
-    st.markdown("**Rango de Fechas**")
     min_date = daily['Date'].min().date()
     max_date = daily['Date'].max().date()
-    date_range = st.date_input(
-        "Selecciona el período",
-        value=(max(min_date, max_date - timedelta(days=365)), max_date),
-        min_value=min_date, max_value=max_date,
-    )
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        d_start, d_end = date_range
-    else:
-        d_start, d_end = min_date, max_date
+    d_start, d_end = min_date, max_date
 
     st.divider()
     st.markdown("**Filtrar por Producto**")
@@ -1327,8 +1318,8 @@ with st.sidebar:
         "hardcoded":     ("hardcoded (Render inactivo)", "#E65100"),
     }
     _stock_label, _stock_color = _src_map.get(_stock_source, ("desconocido", "#E65100"))
-    _sales_label = "Amphora ✓"
-    _sales_color = "#2E7D32"   if _data_from_amphora else "#1565C0"
+    _sales_label = "Shopify ✓" if not _data_from_amphora else "Amphora ✓"
+    _sales_color = "#1565C0"   if not _data_from_amphora else "#2E7D32"
     st.markdown(
         f"<div style='font-size:0.78rem;color:#78909C;'>"
         f"Plazo de entrega: <b>{LEAD_TIME_DAYS} días</b> · "
@@ -1389,7 +1380,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 # ══════════════════════════════════════════════════════════════
 with tab1:
     st.markdown("### Demanda Diaria del Consumidor")
-    st.caption(f"Período: {d_start.strftime('%d/%m/%Y')} — {d_end.strftime('%d/%m/%Y')}")
+    st.caption(f"Historial completo: {d_start.strftime('%d/%m/%Y')} — {d_end.strftime('%d/%m/%Y')}")
 
     overall = (daily_filtered.groupby('Date')['Units'].sum()
                .reset_index().sort_values('Date'))
