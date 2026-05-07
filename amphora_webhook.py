@@ -49,10 +49,13 @@ ORDERS_FILE   = BASE_DIR / "amphora_orders.json"
 RETURNS_FILE  = BASE_DIR / "amphora_returns.json"
 FULFILLED_FILE = BASE_DIR / "amphora_fulfilled.json"
 
-AMPHORA_SECRET = os.environ.get("AMPHORA_SECRET", "")
-SHOPIFY_TOKEN  = os.environ.get("SHOPIFY_TOKEN", "")
-SHOPIFY_SHOP   = os.environ.get("SHOPIFY_SHOP", "frnr50-hx.myshopify.com")
-HOLDED_API_KEY = os.environ.get("HOLDED_API_KEY", "")
+AMPHORA_SECRET     = os.environ.get("AMPHORA_SECRET", "")
+SHOPIFY_TOKEN      = os.environ.get("SHOPIFY_TOKEN", "")
+SHOPIFY_SHOP       = os.environ.get("SHOPIFY_SHOP", "frnr50-hx.myshopify.com")
+HOLDED_API_KEY     = os.environ.get("HOLDED_API_KEY", "")
+AMPHORA_API_KEY    = os.environ.get("AMPHORA_API_KEY", "")
+AMPHORA_COMPANY_ID = os.environ.get("AMPHORA_COMPANY_ID", "")
+AMPHORA_API_BASE   = "https://api.amphoralogistics.com/prod-integrations-api"
 
 app = FastAPI(title="Enertex · Amphora Bridge", version="1.0")
 
@@ -74,6 +77,74 @@ def _verify(x_secret: Optional[str]) -> None:
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Amphora Company API: pull inventory ───────────────────────
+async def _fetch_amphora_inventory() -> Optional[dict]:
+    """
+    Fetch current inventory levels from the Amphora Company API
+    (GET /inventory/{company_id}) and refresh the stock cache.
+
+    Requires env vars:
+      AMPHORA_API_KEY    — API key provided by Amphora
+      AMPHORA_COMPANY_ID — Your company ID in Amphora
+
+    Aggregates available_quantity per SKU across all warehouse locations.
+    Returns the updated cache dict, or None on failure / missing credentials.
+    """
+    if not AMPHORA_API_KEY or not AMPHORA_COMPANY_ID:
+        return None
+
+    inventory_levels: list = []
+    url: Optional[str] = f"{AMPHORA_API_BASE}/inventory/{AMPHORA_COMPANY_ID}"
+    headers = {"x-api-key": AMPHORA_API_KEY}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            inventory_levels.extend(data.get("inventory_levels", []))
+            # Follow cursor-based pagination
+            next_url = data.get("next_url")
+            url = (f"{AMPHORA_API_BASE}{next_url}" if next_url and not next_url.startswith("http") else next_url)
+
+    if not inventory_levels:
+        return None
+
+    # Aggregate available_quantity per SKU across all locations
+    stock_map: dict[str, int] = {}
+    sku_detail: list[dict] = []
+    for item in inventory_levels:
+        sku = item.get("sku", "").strip()
+        qty = int(item.get("available_quantity", 0))
+        if not sku:
+            continue
+        stock_map[sku] = stock_map.get(sku, 0) + qty
+        sku_detail.append({
+            "product":           sku,
+            "variant":           "",
+            "sku":               sku,
+            "quantity":          qty,
+            "reserved_quantity": int(item.get("reserved_quantity", 0)),
+            "location_id":       item.get("location_id", ""),
+            "updated_at":        item.get("updated_at", ""),
+        })
+
+    output = {
+        "updated_at":   _timestamp(),
+        "source":       "amphora_api",
+        "stock":        stock_map,
+        "stock_by_sku": sku_detail,
+    }
+    _stock_cache.clear()
+    _stock_cache.update(output)
+    try:
+        STOCK_FILE.write_text(json.dumps(output, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+    return output
 
 
 # ── GET /orders ───────────────────────────────────────────────
@@ -300,6 +371,30 @@ async def receive_stock(
     }
 
 
+# ── GET /refresh-inventory  ◄── PULL LIVE STOCK FROM AMPHORA ─
+@app.get("/refresh-inventory")
+async def refresh_inventory():
+    """
+    Manually trigger a pull of current inventory levels from the Amphora
+    Company API.  No authentication required (data is not sensitive).
+    Requires AMPHORA_API_KEY and AMPHORA_COMPANY_ID env vars to be set.
+    """
+    if not AMPHORA_API_KEY or not AMPHORA_COMPANY_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="AMPHORA_API_KEY and AMPHORA_COMPANY_ID env vars are not configured.",
+        )
+    result = await _fetch_amphora_inventory()
+    if result is None:
+        raise HTTPException(status_code=502, detail="Failed to fetch inventory from Amphora API.")
+    return {
+        "status":      "ok",
+        "products":    len(result["stock"]),
+        "updated_at":  result["updated_at"],
+        "source":      result["source"],
+    }
+
+
 # ── POST /return-status (+ sub-routes for each status) ──────
 async def _save_return_event(request: Request, x_secret: Optional[str], status: str) -> dict:
     _verify(x_secret)
@@ -483,27 +578,35 @@ async def health():
         except Exception:
             pass
     return {
-        "status":                "ok",
-        "secret_configured":     bool(AMPHORA_SECRET),
-        "holded_configured":     bool(HOLDED_API_KEY),
-        "shopify_configured":    bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
-        "stock_last_updated":    src.get("updated_at"),
-        "stock_products":        len(src.get("stock", {})),
-        "stock_variants":        len(src.get("stock_by_sku", [])),
-        "order_events_stored":   order_count,
-        "fulfilled_orders_stored": fulfilled_count,
+        "status":                    "ok",
+        "secret_configured":         bool(AMPHORA_SECRET),
+        "holded_configured":         bool(HOLDED_API_KEY),
+        "shopify_configured":        bool(SHOPIFY_TOKEN and SHOPIFY_SHOP),
+        "amphora_api_configured":    bool(AMPHORA_API_KEY and AMPHORA_COMPANY_ID),
+        "stock_source":              src.get("source", "none"),
+        "stock_last_updated":        src.get("updated_at"),
+        "stock_products":            len(src.get("stock", {})),
+        "stock_variants":            len(src.get("stock_by_sku", [])),
+        "order_events_stored":       order_count,
+        "fulfilled_orders_stored":   fulfilled_count,
     }
 
 
 @app.on_event("startup")
 async def _load_cache_from_disk() -> None:
-    """Pre-load the last known stock into the in-memory cache on startup."""
+    """Pre-load stock from disk, then try to refresh from Amphora Company API."""
     if STOCK_FILE.exists():
         try:
             d = json.loads(STOCK_FILE.read_text(encoding="utf-8"))
             _stock_cache.update(d)
         except Exception:
             pass
+    # If Amphora API credentials are configured, fetch fresh inventory on startup
+    if AMPHORA_API_KEY and AMPHORA_COMPANY_ID:
+        try:
+            await _fetch_amphora_inventory()
+        except Exception:
+            pass  # Non-fatal — cached/disk data will be used as fallback
 
 
 if __name__ == "__main__":
