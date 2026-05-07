@@ -1652,10 +1652,21 @@ with tab3:
             hovertext=subset['_hover'],
             hovertemplate='%{hovertext}<extra></extra>'))
 
-    # Cap x-axis at 95th percentile of ROP values so outliers don't compress the chart.
-    # Outlier SKUs are still fully visible — the diamond marker just extends past the axis.
-    _rop_vals = pd.concat([rop['_rop_total'], rop['_stock']]).dropna()
-    _x_cap = float(np.percentile(_rop_vals[_rop_vals > 0], 95)) * 1.15 if (_rop_vals > 0).any() else None
+    # Cap x-axis on the ROP bars only (not on stock diamonds which can be outliers).
+    # Use max(ROP, safety_stock) at p90 so the bars are readable, then let
+    # overstocked diamonds clip past the axis — they get a ▶ annotation.
+    _rop_nonzero = rop['_rop_total'][rop['_rop_total'] > 0]
+    _x_cap = float(np.percentile(_rop_nonzero, 90)) * 1.25 if len(_rop_nonzero) else None
+
+    # Add ▶ annotations for diamonds that fall outside the visible range
+    if _x_cap:
+        for _, _rr in rop[rop['_stock'] > _x_cap].iterrows():
+            fig3.add_annotation(
+                x=_x_cap, y=_rr['Producto'],
+                text=f"▶ {_rr['_stock']:.0f}",
+                showarrow=False,
+                xanchor='left', font=dict(size=9, color=C_RED if _rr['Below_ROP'] else '#1B5E20'),
+                xref='x', yref='y')
 
     styled_fig(fig3,
         barmode='stack',
