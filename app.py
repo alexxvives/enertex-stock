@@ -1838,7 +1838,7 @@ with tab4:
         return [''] * len(row)
 
     styled = (tbl.style
-              .applymap(style_estado, subset=['Estado'])
+              .map(style_estado, subset=['Estado'])
               .apply(style_highlight_row, axis=1)
               .format(na_rep='—')
               .set_properties(**{'text-align': 'left'}, subset=['Producto']))
