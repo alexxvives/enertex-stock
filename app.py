@@ -19,7 +19,7 @@ Tabs:
   7  Detalle por SKU    — historial semanal + distribución diaria
 """
 
-import warnings, os
+import warnings, os, io
 warnings.filterwarnings('ignore')
 
 import streamlit as st
@@ -499,7 +499,7 @@ def _prophet_forecast(product, daily_json, horizon_weeks):
         from prophet import Prophet  # noqa
     except ImportError:
         return None
-    df = pd.read_json(daily_json)
+    df = pd.read_json(io.StringIO(daily_json))
     # Robust column access — don’t assume column ORDER from JSON
     if 'ds' not in df.columns or 'y' not in df.columns:
         if df.shape[1] == 2:
@@ -585,7 +585,7 @@ def get_forecast(product, daily_df, forecast_curves, horizon_weeks):
     result_json = _prophet_forecast(product, json_str, horizon_weeks + 8)
     if result_json is None:
         return base if in_parquet else pd.DataFrame(), 'none'
-    fc = pd.read_json(result_json)
+    fc = pd.read_json(io.StringIO(result_json))
     fc['ds'] = pd.to_datetime(fc['ds'])
     for col in ['yhat', 'yhat_lower', 'yhat_upper']:
         if col in fc.columns:
@@ -1661,14 +1661,20 @@ with tab3:
             hovertext=subset['_hover'],
             hovertemplate='%{hovertext}<extra></extra>'))
 
+    # Cap x-axis at 95th percentile of ROP values so outliers don't compress the chart.
+    # Outlier SKUs are still fully visible — the diamond marker just extends past the axis.
+    _rop_vals = pd.concat([rop['_rop_total'], rop['_stock']]).dropna()
+    _x_cap = float(np.percentile(_rop_vals[_rop_vals > 0], 95)) * 1.15 if (_rop_vals > 0).any() else None
+
     styled_fig(fig3,
         barmode='stack',
         height=max(500, 26*len(rop)),
-        hovermode='closest',          # ← FIX: evita tooltips girados
+        hovermode='closest',
         legend=dict(orientation='h', y=1.06, x=0.5, xanchor='center',
                     font_size=11, bgcolor='rgba(255,255,255,0.9)',
                     bordercolor='#E0E0E0', borderwidth=1),
-        xaxis=dict(title='Unidades', rangemode='tozero'),
+        xaxis=dict(title='Unidades', rangemode='tozero',
+                   **({'range': [0, _x_cap]} if _x_cap else {})),
         yaxis=dict(autorange='reversed', tickfont_size=10),
         margin=dict(t=70, b=50, l=10, r=20))
     if sel_product and sel_product in rop['Producto'].values:
