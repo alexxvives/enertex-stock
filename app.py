@@ -673,29 +673,102 @@ def _render_prophet_chart(fc_df, act_w, height=450):
 
 
 # ──────────────────────────────────────────────────────────────
-#  SAFETY STOCK — STL residual σ (state-of-art)
+#  SAFETY STOCK — state-of-art: STL + Croston/SBA + peak buffer + ABC
 # ──────────────────────────────────────────────────────────────
-def _stl_sigma(ts: "pd.Series") -> float:
-    """Return STL residual σ for a daily demand series.
 
-    STL (Seasonal-Trend decomposition via LOESS) decomposes the series into
-    trend + weekly-seasonal + residual.  Safety stock is driven by the
-    *residual* component only — the truly unpredictable variation.
-    Predictable seasonal spikes (Black Friday, Christmas) go into the
-    seasonal component and no longer inflate year-round safety stock.
+# Peak reference dates (Monday of Black Friday week each year)
+_BF_DATES   = pd.to_datetime(['2023-11-20', '2024-11-25', '2025-11-24'])
+_XMAS_DATES = pd.to_datetime(['2023-12-18', '2024-12-16', '2025-12-15'])
+_PEAK_PLAN_DAYS = 21   # days before peak week when extra buffer kicks in
 
-    Falls back to raw σ when the series is too short or too sparse for a
-    reliable decomposition (< 8 weeks / < 10 non-zero days).
+# ABC service levels — Z-scores for 3 revenue tiers
+_SL_A = stats.norm.ppf(0.98)   # top 70 % cumulative revenue  → 98 %
+_SL_B = stats.norm.ppf(0.95)   # 70–90 % cumulative revenue   → 95 %
+_SL_C = stats.norm.ppf(0.90)   # bottom 10 % cumulative rev.  → 90 %
+
+
+def _demand_params(ts: "pd.Series") -> "tuple[float, float]":
+    """Return (avg_daily, sigma_daily) using the best statistical method.
+
+    Routing logic (in priority order):
+    ① Sparse / intermittent demand (>60 % zero days):
+       • Croston/SBA mean  — eliminates the downward bias of standard smoothing
+         on intermittent series (Syntetos & Boylan 2005).
+       • Compound Bernoulli-Poisson variance: Var(D) = p·σ²_z + p·(1-p)·μ²_z
+         where p = demand probability, μ_z / σ_z = moments of non-zero demands.
+       • Safety stock for lumpy accessories / book lights / BEEM / etc.
+         is now correctly driven by *demand-event* variability, not zero-padding.
+
+    ② Regular demand with ≥8 weeks of history:
+       • STL residual σ — decomposes series into trend + weekly seasonal +
+         residual via LOESS. Safety stock uses residual σ only, so predictable
+         holiday spikes (Black Friday, Christmas) no longer inflate σ year-round.
+
+    ③ Short history (<8 weeks or <5 non-zero days):
+       • Conservative fallback to raw mean and raw σ (no decomposition).
     """
-    raw_sigma = float(ts.std(ddof=1)) if len(ts) > 1 else 0.0
-    if len(ts) < 56 or int((ts > 0).sum()) < 10:
-        return raw_sigma
-    try:
-        from statsmodels.tsa.seasonal import STL
-        result = STL(ts, period=7, robust=True, seasonal=13).fit()
-        return max(float(result.resid.std(ddof=1)), 0.0)
-    except Exception:
-        return raw_sigma
+    n         = len(ts)
+    n_nonzero = int((ts > 0).sum())
+    raw_avg   = float(ts.mean())
+    raw_sigma = float(ts.std(ddof=1)) if n > 1 else 0.0
+
+    if n < 14 or n_nonzero < 5:
+        return raw_avg, raw_sigma
+
+    p = n_nonzero / n  # daily demand-occurrence probability
+
+    # ① Intermittent: >60 % zero days → Croston/SBA + compound variance
+    if p < 0.40:
+        nz    = ts[ts > 0]
+        mu_z  = float(nz.mean())
+        var_z = float(nz.var(ddof=1)) if len(nz) > 1 else 0.0
+        alpha = 0.10  # standard Croston smoothing factor
+        mu_sba = (1 - alpha / 2) * p * mu_z          # SBA-corrected mean
+        comp_var = p * var_z + p * (1 - p) * (mu_z ** 2)
+        return mu_sba, max(float(np.sqrt(comp_var)), 0.0)
+
+    # ② Regular demand with enough history → STL residual σ
+    if n >= 56 and n_nonzero >= 10:
+        try:
+            from statsmodels.tsa.seasonal import STL
+            result = STL(ts, period=7, robust=True, seasonal=13).fit()
+            return raw_avg, max(float(result.resid.std(ddof=1)), 0.0)
+        except Exception:
+            pass
+
+    # ③ Short / irregular history — raw stats
+    return raw_avg, raw_sigma
+
+
+def _peak_extra_buffer(full_ts: "pd.Series") -> float:
+    """Extra daily demand buffer to stock up before seasonal peaks.
+
+    During the 3-week planning window before Black Friday or Christmas,
+    safety stock is boosted by the historical peak-demand surplus:
+        extra = max(0, mean_peak_day − mean_baseline_day)
+
+    This adds targeted buffer only when you actually need to pre-stock,
+    and returns 0 the rest of the year so baseline SS stays lean.
+    Returns 0 when history is insufficient (<30 days).
+    """
+    today = pd.Timestamp.now().normalize()
+    in_window = any(
+        (pk - pd.Timedelta(days=_PEAK_PLAN_DAYS + 7)) <= today <= (pk - pd.Timedelta(days=1))
+        for pk in list(_BF_DATES) + list(_XMAS_DATES)
+    )
+    if not in_window or len(full_ts) < 30:
+        return 0.0
+
+    peak_vals = []
+    for pk in list(_BF_DATES) + list(_XMAS_DATES):
+        mask = (full_ts.index >= pk - pd.Timedelta(days=1)) & \
+               (full_ts.index <= pk + pd.Timedelta(days=6))
+        if mask.sum() >= 3:
+            peak_vals.extend(full_ts[mask].tolist())
+
+    if not peak_vals:
+        return 0.0
+    return max(float(np.mean(peak_vals)) - float(full_ts.mean()), 0.0)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -909,23 +982,60 @@ def load_all():
                    .fillna({'Units': 0}))
 
     _avg_win  = _win_full.groupby('Producto')['Units'].mean().rename('Avg_Daily_Sales')
-    # STL residual σ: seasonal spikes (Black Friday, Christmas) go into the
-    # seasonal component — residual σ captures only truly random variation.
-    # This prevents holiday variance from inflating safety stock year-round.
-    _std_win  = (_win_full.groupby('Producto')['Units']
-                 .apply(_stl_sigma)
+    # _demand_params routes to: Croston/SBA (intermittent) → STL residual σ
+    # (regular+history) → raw σ (short history). Returns (avg, sigma) per SKU.
+    _dp = (_win_full.groupby('Producto')['Units']
+           .apply(lambda s: pd.Series(_demand_params(s), index=['avg', 'sigma'])))
+    _avg_win = _dp['avg'].rename('Avg_Daily_Sales')
+    _std_win = _dp['sigma'].rename('Std_Daily_Sales')
+
+    # ── Peak forward buffer — uses FULL history (not just 180-day window) ─────
+    # Builds a full (all-time) daily grid so past Black Fridays are visible.
+    _full_grid = (pd.MultiIndex
+                  .from_product([_all_skus,
+                                 pd.date_range(daily['Date'].min(), _d_max, freq='D')],
+                                names=['Producto', 'Date'])
+                  .to_frame(index=False))
+    _full_daily = (_full_grid
+                   .merge(daily[['Producto', 'Date', 'Units']],
+                          on=['Producto', 'Date'], how='left')
+                   .fillna({'Units': 0}))
+    _peak_buf = (_full_daily.groupby('Producto')['Units']
+                 .apply(_peak_extra_buffer)
                  .fillna(0)
-                 .rename('Std_Daily_Sales'))
+                 .rename('Peak_Buffer_Daily'))
 
     sku_stats = (daily.groupby('Producto')
                  .agg(Total_Units=('Units', 'sum'),
                       Total_Revenue=('Revenue', 'sum'))
                  .reset_index())
-    sku_stats = sku_stats.join(_avg_win, on='Producto').join(_std_win, on='Producto')
-    sku_stats['Avg_Daily_Sales']  = sku_stats['Avg_Daily_Sales'].fillna(0)
-    sku_stats['Std_Daily_Sales']  = sku_stats['Std_Daily_Sales'].fillna(0)
+    sku_stats = (sku_stats
+                 .join(_avg_win, on='Producto')
+                 .join(_std_win, on='Producto')
+                 .join(_peak_buf, on='Producto'))
+    sku_stats['Avg_Daily_Sales']   = sku_stats['Avg_Daily_Sales'].fillna(0)
+    sku_stats['Std_Daily_Sales']   = sku_stats['Std_Daily_Sales'].fillna(0)
+    sku_stats['Peak_Buffer_Daily'] = sku_stats['Peak_Buffer_Daily'].fillna(0)
 
-    sku_stats['Safety_Stock'] = Z_SCORE * sku_stats['Std_Daily_Sales'] * np.sqrt(LEAD_TIME_DAYS)
+    # ── ABC service levels ────────────────────────────────────────────────────
+    # A (top 70 % cumulative revenue)  → 98 % service level  Z = 2.05
+    # B (70–90 % cumulative revenue)   → 95 % service level  Z = 1.65
+    # C (bottom 10 % cumulative rev.)  → 90 % service level  Z = 1.28
+    _rev_sorted = sku_stats.sort_values('Total_Revenue', ascending=False)
+    _total_rev  = _rev_sorted['Total_Revenue'].sum()
+    _cum_pct    = _rev_sorted['Total_Revenue'].cumsum() / max(_total_rev, 1)
+    _class_map  = {}
+    for _prod, _cp in zip(_rev_sorted['Producto'], _cum_pct):
+        if _cp <= 0.70:   _class_map[_prod] = 'A'
+        elif _cp <= 0.90: _class_map[_prod] = 'B'
+        else:             _class_map[_prod] = 'C'
+    sku_stats['ABC_Class'] = sku_stats['Producto'].map(_class_map).fillna('C')
+    sku_stats['Z_Score']   = sku_stats['ABC_Class'].map({'A': _SL_A, 'B': _SL_B, 'C': _SL_C})
+
+    sku_stats['Safety_Stock'] = (
+        sku_stats['Z_Score'] * sku_stats['Std_Daily_Sales'] * np.sqrt(LEAD_TIME_DAYS)
+        + sku_stats['Peak_Buffer_Daily'] * LEAD_TIME_DAYS
+    )
     sku_stats['LT_Demand']    = sku_stats['Avg_Daily_Sales'] * LEAD_TIME_DAYS
 
     # Buffer revendedor
@@ -1484,21 +1594,26 @@ with tab3:
     rop['_status'] = rop['Action']
     rop['_avg'] = rop['Avg_Daily_Sales'].round(2)
     rop['_std'] = rop['Std_Daily_Sales'].round(2) if 'Std_Daily_Sales' in rop.columns else 0
+    rop['_abc'] = rop['ABC_Class'] if 'ABC_Class' in rop.columns else 'B'
+    rop['_z']   = rop['Z_Score'].round(2)   if 'Z_Score'   in rop.columns else Z_SCORE
+    rop['_pk']  = (rop['Peak_Buffer_Daily'] * LEAD_TIME_DAYS).round(0) if 'Peak_Buffer_Daily' in rop.columns else 0
 
     # Build unified hover text per row (so hovering ANY element shows everything)
     hover_texts = []
     for _, rr in rop.iterrows():
         txt = (f"<b>{rr['Producto']}</b><br>"
                f"Estado: {rr['_status']}<br>"
+               f"Clase ABC: {rr['_abc']}  |  Z = {rr['_z']:.2f}<br>"
                f"Stock actual: {rr['_stock']:.0f} u<br>"
                f"Punto de reorden: {rr['_rop_total']:.0f} u<br>"
                f"—————————<br>"
                f"Demanda LT: {rr['_lt']:.0f} u<br>"
                f"Stock seguridad: {rr['_ss']:.0f} u<br>"
+               f"Buffer pico estacional: {rr['_pk']:.0f} u<br>"
                f"Buffer reseller: {rr['_rb']:.0f} u<br>"
                f"—————————<br>"
                f"Venta media: {rr['_avg']:.2f} u/día<br>"
-               f"σ diaria ({STATS_WINDOW_DAYS}d): {rr['_std']:.2f} u")
+               f"σ residual ({STATS_WINDOW_DAYS}d): {rr['_std']:.2f} u")
         hover_texts.append(txt)
     rop['_hover'] = hover_texts
 
@@ -1611,7 +1726,7 @@ with tab3:
         _rop_total = rop_sel['_lt'] + rop_sel['_ss'] + rop_sel['_rb']
         _avg_row   = proc[proc['Producto'] == sel_product]['Avg_Daily_Sales']
         _avg_val   = float(_avg_row.iloc[0]) if len(_avg_row) else 0.0
-        c1d, c2d, c3d, c4d, c5d = st.columns(5)
+        c1d, c2d, c3d, c4d, c5d, c6d = st.columns(6)
         c1d.metric("Stock actual", f"{rop_sel['_stock']:.0f} u",
                    delta=f"{rop_sel['_stock'] - _rop_total:+.0f} u vs ROP",
                    delta_color='normal' if rop_sel['_stock'] >= _rop_total else 'inverse')
@@ -1619,41 +1734,40 @@ with tab3:
         c3d.metric("Demanda en tránsito", f"{rop_sel['_lt']:.0f} u")
         c4d.metric("Stock de seguridad", f"{rop_sel['_ss']:.0f} u")
         c5d.metric("Venta media / día", f"{_avg_val:.2f} u")
+        c6d.metric("Clase ABC / Z", f"{rop_sel['_abc']} / {rop_sel['_z']:.2f}")
 
     # Explicaciones detalladas
     st.markdown("""
 <div class="explain-grid">
 <div class="explain-item"><strong>Demanda en tránsito (barra azul)</strong>
 <span>Las unidades que se <b>seguirán vendiendo</b> mientras tu pedido viaja desde el proveedor.
-Si pides hoy y el stock llega en """ + str(LEAD_TIME_DAYS) + """ días, durante esos días la tienda
-sigue vendiendo. Hay que tener ese stock cubierto antes de pedir.
-Fórmula: <code>Venta media diaria × Plazo de entrega (""" + str(LEAD_TIME_DAYS) + """ días)</code>.</span></div>
+Fórmula: <code>Venta media diaria × Plazo de entrega (""" + str(LEAD_TIME_DAYS) + """ días)</code>.
+Para demanda intermitente (accesorios, BEEM, etc.) se usa el estimador Croston/SBA
+que corrige el sesgo a la baja del promedio simple en series con muchos ceros.</span></div>
 
 <div class="explain-item"><strong>Stock de seguridad (barra naranja)</strong>
-<span>Colchón extra para absorber imprevistos: picos de demanda o retrasos en la entrega.
-Fórmula: <code>Z × σ × √LT</code>, donde Z=""" + f"{Z_SCORE:.2f}" + """ (nivel de servicio 95%),
-σ es la desviación estándar de ventas diarias (últimos """ + str(STATS_WINDOW_DAYS) + """ días) y LT el plazo de entrega.</span></div>
+<span>Colchón para absorber imprevistos. Usa la σ <b>residual</b> (STL):
+el pico de Black Friday se separa como componente estacional y <b>no infla el SS el resto del año</b>.
+Para SKUs intermitentes se usa la varianza compuesta Bernoulli-Poisson.
+Fórmula: <code>Z × σ_residual × √LT + buffer_pico</code>.</span></div>
+
+<div class="explain-item"><strong>Buffer pico estacional</strong>
+<span>Sólo activo las 3 semanas antes de Black Friday y Navidad.
+Mide el exceso histórico de demanda en semanas pico vs. la media basal
+y lo añade como stock extra durante la ventana de planificación.</span></div>
+
+<div class="explain-item"><strong>Clase ABC y nivel de servicio (Z)</strong>
+<span><b>A</b> (top 70% facturación): Z = 2.05 → 98% servicio.<br>
+<b>B</b> (70–90% facturación): Z = 1.65 → 95% servicio.<br>
+<b>C</b> (resto): Z = 1.28 → 90% servicio.<br>
+Los productos de mayor valor tienen mayor protección contra rotura de stock.</span></div>
 
 <div class="explain-item"><strong>Buffer revendedor (barra verde)</strong>
-<span>Reserva adicional para cubrir pedidos de revendedores, que suelen ser
-más grandes e irregulares que los de consumidores finales. Se estima con el
-método de Croston a partir del histórico de pedidos B2B.</span></div>
-
-<div class="explain-item"><strong>Rombo — Stock actual</strong>
-<span><b style="color:#C62828">Rombo rojo</b>: el stock está por debajo del punto de reorden;
-hay que pedir ya.<br>
-<b style="color:#1B5E20">Rombo verde</b>: el stock supera el ROP; no se requiere acción inmediata.</span></div>
-
-<div class="explain-item"><strong>¿Qué es el Nivel de Servicio (95%)?</strong>
-<span>Es la probabilidad de no quedarse sin stock durante el plazo de entrega.
-Un 95% significa que en 95 de cada 100 ciclos de reposición, el inventario
-será suficiente para cubrir la demanda. Un nivel más alto requiere más
-stock de seguridad (y más capital inmovilizado).</span></div>
+<span>Reserva adicional para pedidos B2B, que suelen ser más grandes e irregulares.</span></div>
 
 <div class="explain-item"><strong>Punto de Reorden (ROP)</strong>
-<span>Es la suma de las tres barras: <code>Demanda LT + Stock seguridad + Buffer reseller</code>.
-Cuando el stock cae por debajo de este umbral, se recomienda lanzar un pedido
-de reposición.</span></div>
+<span>Suma de todas las barras: <code>Demanda LT + Stock seguridad + Buffer reseller</code>.
+Cuando el stock (rombo) cae por debajo de este umbral, se recomienda pedir.</span></div>
 </div>
     """, unsafe_allow_html=True)
 
